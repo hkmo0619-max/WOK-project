@@ -1,0 +1,4 @@
+numpy>=1.23
+opencv-python>=4.8
+pyrealsense2>=2.50
+
