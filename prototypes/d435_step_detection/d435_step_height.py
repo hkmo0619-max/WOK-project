@@ -1,618 +1,816 @@
 #!/usr/bin/env python3
-"""Intel RealSense D435 single-step boundary and riser-height detector.
+"""D435 two-boundary step-height detector.
 
-The two RGB boundaries locate the upper and lower edges of the step's front
-face. A candidate is accepted only when its upper, middle, and lower samples
-belong to the same depth plane. The vertical 3D Y difference between the two
-boundaries is then reported as the step height.
+Measurement rule used by this file (no plane fitting):
 
-q/ESC: quit, r: reset tracking/height, i: show/hide ROI
+1. Detect a short, reliable upper/lower RGB boundary pair.
+2. Sample Depth 8..10 px ABOVE the upper boundary and BELOW the lower one.
+3. Deproject every valid sample to SDK 3D XYZ coordinates.
+4. height = abs(median(Y_lower) - median(Y_upper)).
+
+Only the RGB result window is shown. Canny/Depth images stay internal.
+
+Keys: q/ESC quit, r reset, i show/hide the detection ROI.
 """
 
 from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, replace
-from typing import Callable, Deque, List, Optional, Sequence, Tuple
+from typing import Callable, Deque, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
 
 
-DETECTOR_BUILD = "RGBD848_FACE_HEIGHT_V13"
-STATUS_SEARCHING = "SEARCHING FOR TWO RGB BOUNDARIES"
-STATUS_DETECTED = "RGB BOUNDARIES DETECTED"
+BUILD = "D435_TWO_BOUNDARY_MEDIAN_Y_V1_8_TO_10PX"
+Deproject = Callable[[Tuple[float, float], float], Sequence[float]]
 
 
 @dataclass(frozen=True)
-class DetectorConfig:
+class Config:
+    # D435 streams
     width: int = 848
     height: int = 480
     fps: int = 30
+
+    # Central/lower RGB detection ROI. Coordinates are never cropped, so the
+    # RGB pixels and the aligned Depth pixels keep the same coordinate system.
     roi_left: float = 0.20
     roi_top: float = 0.35
     roi_right: float = 0.80
     roi_bottom: float = 1.00
-    clahe_clip_limit: float = 2.0
-    clahe_tile_size: Tuple[int, int] = (8, 8)
-    gaussian_kernel: Tuple[int, int] = (5, 5)
-    gaussian_sigma: float = 1.0
-    canny_low: int = 50
-    canny_high: int = 150
-    hough_threshold: int = 40
-    hough_min_line_length_px: int = 40
-    hough_max_line_gap_px: int = 20
-    max_angle_deg: float = 7.0
-    merge_y_px: float = 9.0
-    min_final_length_ratio: float = 0.08
-    min_boundary_gap_px: float = 35.0
-    max_boundary_gap_px: float = 220.0
-    min_pair_overlap_ratio: float = 0.35
-    min_pair_common_width_ratio_of_roi: float = 0.25
-    min_lower_boundary_y_ratio: float = 0.50
-    floor_band_start_px: int = 8
-    floor_band_end_px: int = 40
-    floor_min_visible_band_px: int = 16
-    floor_side_gap_px: int = 8
-    floor_min_side_width_px: int = 16
-    floor_vertical_gradient_threshold: float = 30.0
-    floor_max_edge_density: float = 0.075
-    floor_max_density_over_reference: float = 0.060
-    floor_preference_bonus: float = 80.0
-    confirm_frames: int = 5
-    tracking_tolerance_px: float = 14.0
-    smoothing_alpha: float = 0.25
-    max_missed_frames: int = 12
-    display_line_length_px: float = 160.0
-    depth_min_m: float = 0.25
-    depth_max_m: float = 1.50
+
+    # RGB horizontal-line detector
+    clahe_clip: float = 2.0
+    canny_low: int = 45
+    canny_high: int = 135
+    hough_threshold: int = 30
+    hough_min_length_px: int = 42
+    hough_max_gap_px: int = 18
+    max_line_angle_deg: float = 7.0
+    merge_y_px: float = 7.0
+    merge_x_gap_px: float = 28.0
+    merge_slope_delta: float = 0.10
+    max_merged_lines: int = 24
+
+    # Two-boundary geometry. The complete object width is not required.
+    min_boundary_length_px: float = 55.0
+    min_common_width_px: float = 70.0
+    min_overlap_ratio: float = 0.42
+    min_boundary_gap_px: float = 25.0
+    max_boundary_gap_px: float = 140.0
+    max_pair_slope_delta: float = 0.12
+    min_space_below_lower_px: int = 16
+    min_lower_position_in_roi: float = 0.36
+    display_line_length_px: float = 180.0
+
+    # Valid D435 working range selected for this project.
+    depth_min_m: float = 0.30
+    depth_max_m: float = 1.00
+    depth_patch_radius_px: int = 1
+
+    # Quick Depth check used only to reject printed/background RGB lines.
+    # It does NOT calculate height and does NOT fit a plane.
+    evidence_x_samples: int = 18
+    evidence_offsets_px: Tuple[int, ...] = (6, 10, 14)
+    evidence_min_valid_columns: int = 7
+    evidence_min_transition_m: float = 0.004
+    evidence_max_face_layer_delta_m: float = 0.035
+    min_evidence_tier: int = 1
+
+    # Height measurement bands: exactly 8~10 px from each edge.
     height_x_samples: int = 48
-    height_edge_inset_px: int = 8
-    height_patch_radius_px: int = 2
-    height_min_valid_samples: int = 30
-    height_face_depth_fractions: Tuple[float, ...] = (0.00, 0.50, 1.00)
-    height_max_edge_depth_delta_m: float = 0.01
-    height_mad_scale: float = 3.5
+    height_band_offsets_px: Tuple[int, ...] = (6, 7, 8)
+    height_x_inset_px: float = 7.0
+    height_min_valid_columns: int = 24
+    height_min_paired_columns: int = 18
+    surface_outlier_mad_scale: float = 3.5
+    surface_outlier_min_tolerance_m: float = 0.003
+    surface_max_y_spread_m: float = 0.012
+    height_max_column_spread_m: float = 0.012
+    height_min_m: float = 0.010
+    height_max_m: float = 0.200
+
+    # Boundary and height temporal stability
+    boundary_window_frames: int = 5
+    boundary_required_frames: int = 3
+    boundary_y_tolerance_px: float = 13.0
+    boundary_gap_tolerance_px: float = 15.0
+    boundary_slope_tolerance: float = 0.08
+    boundary_hold_frames: int = 2
+    evidence_confirm_frames: int = 2
+    evidence_hold_frames: int = 2
+    boundary_smoothing_alpha: float = 0.30
+    max_missed_frames: int = 6
     height_history_frames: int = 7
-    height_history_reset_cm: float = 4.0
-    height_min_m: float = 0.02
-    height_max_m: float = 0.30
+    height_required_frames: int = 3
+    height_history_reset_m: float = 0.040
+    height_max_temporal_spread_m: float = 0.006
+
+    # Spatial/temporal filtering is applied after Depth-to-color alignment.
+    use_realsense_filters: bool = True
 
 
 @dataclass
-class _Line:
+class Line:
     x1: float
     y1: float
     x2: float
     y2: float
+    score: float = 0.0
 
-    @property
-    def center_x(self) -> float:
-        return (self.x1 + self.x2) / 2
-
-    @property
-    def center_y(self) -> float:
-        return (self.y1 + self.y2) / 2
+    def __post_init__(self) -> None:
+        if self.x2 < self.x1:
+            self.x1, self.x2 = self.x2, self.x1
+            self.y1, self.y2 = self.y2, self.y1
 
     @property
     def length_x(self) -> float:
         return max(0.0, self.x2 - self.x1)
 
     @property
+    def center_x(self) -> float:
+        return (self.x1 + self.x2) * 0.5
+
+    @property
+    def center_y(self) -> float:
+        return (self.y1 + self.y2) * 0.5
+
+    @property
     def slope(self) -> float:
-        dx = self.x2 - self.x1
-        return 0.0 if abs(dx) < 1e-6 else (self.y2 - self.y1) / dx
+        return (self.y2 - self.y1) / max(self.x2 - self.x1, 1e-6)
 
+    def y_at(self, x: float) -> float:
+        return self.y1 + self.slope * (x - self.x1)
 
-@dataclass
-class BoundaryLine(_Line):
-    score: float
+    def crop(self, left: float, right: float) -> "Line":
+        return Line(left, self.y_at(left), right, self.y_at(right), self.score)
 
     def as_array(self) -> np.ndarray:
-        return np.array((self.x1, self.y1, self.x2, self.y2), np.float32)
+        return np.asarray((self.x1, self.y1, self.x2, self.y2), np.float64)
 
     @classmethod
-    def from_array(cls, values: np.ndarray, score: float = 0.0) -> "BoundaryLine":
-        return cls(*(float(v) for v in values), score)
+    def from_array(cls, values: np.ndarray) -> "Line":
+        return cls(*(float(value) for value in values), score=0.0)
 
 
-BoundaryPair = Tuple[BoundaryLine, BoundaryLine]
-Deproject = Callable[[Tuple[float, float], float], Sequence[float]]
+BoundaryPair = Tuple[Line, Line]
+
+
+@dataclass(frozen=True)
+class PairEvidence:
+    tier: int
+    top_z_m: float
+    face_z_m: float
+    floor_z_m: float
+    upper_transition_m: float
+    lower_transition_m: float
+    face_layer_delta_m: float
+    top_valid: int
+    face_valid: int
+    floor_valid: int
+
+
+@dataclass(frozen=True)
+class SurfaceStats:
+    median_y_m: float
+    median_z_m: float
+    spread_y_m: float
+    valid_columns: int
+    y_by_column: np.ndarray
 
 
 @dataclass(frozen=True)
 class HeightMeasurement:
     height_m: float
     raw_height_m: float
-    front_distance_m: float
-    spread_m: float
-    valid_samples: int
-    total_samples: int
+    signed_height_m: float
+    upper_y_m: float
+    lower_y_m: float
+    front_z_m: float
+    upper_valid: int
+    lower_valid: int
+    paired_valid: int
+    total_columns: int
+    column_spread_m: float
+    temporal_spread_m: float = 0.0
 
 
-def roi_pixels(cfg: DetectorConfig) -> Tuple[int, int, int, int]:
-    return tuple(
-        int(round(value))
-        for value in (
-            cfg.width * cfg.roi_left,
-            cfg.height * cfg.roi_top,
-            cfg.width * cfg.roi_right,
-            cfg.height * cfg.roi_bottom,
-        )
+def roi_bounds(cfg: Config) -> Tuple[int, int, int, int]:
+    return (
+        int(round(cfg.width * cfg.roi_left)),
+        int(round(cfg.height * cfg.roi_top)),
+        int(round(cfg.width * cfg.roi_right)),
+        int(round(cfg.height * cfg.roi_bottom)),
     )
 
 
-def build_hidden_edge_image(
-    color_bgr: np.ndarray, cfg: DetectorConfig
-) -> Tuple[np.ndarray, np.ndarray]:
+def robust_mad(values: np.ndarray) -> float:
+    if values.size == 0:
+        return float("inf")
+    center = float(np.median(values))
+    return float(1.4826 * np.median(np.abs(values - center)))
+
+
+def _outlined_text(
+    image: np.ndarray,
+    text: str,
+    position: Tuple[int, int],
+    scale: float,
+    color: Tuple[int, int, int],
+) -> None:
+    cv2.putText(
+        image, text, position, cv2.FONT_HERSHEY_SIMPLEX,
+        scale, (0, 0, 0), 5, cv2.LINE_AA,
+    )
+    cv2.putText(
+        image, text, position, cv2.FONT_HERSHEY_SIMPLEX,
+        scale, color, 2, cv2.LINE_AA,
+    )
+
+
+def make_rgb_edges(color_bgr: np.ndarray, cfg: Config) -> Tuple[np.ndarray, np.ndarray]:
     gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY)
-    enhanced = cv2.createCLAHE(
-        cfg.clahe_clip_limit, cfg.clahe_tile_size
-    ).apply(gray)
-    blurred = cv2.GaussianBlur(
-        enhanced, cfg.gaussian_kernel, cfg.gaussian_sigma
-    )
+    gray = cv2.createCLAHE(cfg.clahe_clip, (8, 8)).apply(gray)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 1.0)
     edges = cv2.Canny(blurred, cfg.canny_low, cfg.canny_high)
-    x0, y0, x1, y1 = roi_pixels(cfg)
+    edges = cv2.morphologyEx(
+        edges, cv2.MORPH_CLOSE, np.ones((1, 5), np.uint8)
+    )
+
+    x0, y0, x1, y1 = roi_bounds(cfg)
     mask = np.zeros_like(edges)
     mask[y0:y1, x0:x1] = 255
-    return cv2.bitwise_and(edges, mask), enhanced
+    return cv2.bitwise_and(edges, mask), gray
 
 
-def contrast_across_line(
-    gray: np.ndarray, x1: float, y1: float, x2: float, y2: float
-) -> float:
-    left, right = round(min(x1, x2)), round(max(x1, x2))
-    if right - left < 8:
+def contrast_across_line(gray: np.ndarray, line: Line) -> float:
+    count = int(np.clip(round(line.length_x), 12, 120))
+    xs = np.linspace(line.x1, line.x2, count)
+    upper_values: List[float] = []
+    lower_values: List[float] = []
+    for x in xs:
+        y = line.y_at(float(x))
+        xi = int(np.clip(round(x), 0, gray.shape[1] - 1))
+        for offset in (3, 5):
+            yu, yl = round(y - offset), round(y + offset)
+            if 0 <= yu < gray.shape[0]:
+                upper_values.append(float(gray[yu, xi]))
+            if 0 <= yl < gray.shape[0]:
+                lower_values.append(float(gray[yl, xi]))
+    if not upper_values or not lower_values:
         return 0.0
-    xs = np.linspace(left, right, min(160, right - left + 1)).astype(np.int32)
-    ys = np.rint(y1 + (y2 - y1) / max(x2 - x1, 1e-6) * (xs - x1)).astype(
-        np.int32
-    )
-    upper, lower = [], []
-    for offset in (3, 4, 5):
-        yu, yl = ys - offset, ys + offset
-        valid_u = (yu >= 0) & (yu < gray.shape[0])
-        valid_l = (yl >= 0) & (yl < gray.shape[0])
-        if np.any(valid_u):
-            upper.append(gray[yu[valid_u], xs[valid_u]])
-        if np.any(valid_l):
-            lower.append(gray[yl[valid_l], xs[valid_l]])
-    if not upper or not lower:
-        return 0.0
-    return abs(float(np.median(np.concatenate(upper))) - float(np.median(np.concatenate(lower))))
+    return abs(float(np.median(upper_values)) - float(np.median(lower_values)))
 
 
-def find_horizontal_candidates(
-    color_bgr: np.ndarray, cfg: DetectorConfig
-) -> List[BoundaryLine]:
-    edges, gray = build_hidden_edge_image(color_bgr, cfg)
+def find_horizontal_lines(color_bgr: np.ndarray, cfg: Config) -> List[Line]:
+    edges, gray = make_rgb_edges(color_bgr, cfg)
     raw = cv2.HoughLinesP(
         edges,
         1,
-        np.pi / 180,
+        np.pi / 180.0,
         cfg.hough_threshold,
-        minLineLength=cfg.hough_min_line_length_px,
-        maxLineGap=cfg.hough_max_line_gap_px,
+        minLineLength=cfg.hough_min_length_px,
+        maxLineGap=cfg.hough_max_gap_px,
     )
     if raw is None:
         return []
 
-    rx0, _, rx1, _ = roi_pixels(cfg)
-    roi_center, roi_width = (rx0 + rx1) / 2, max(1.0, float(rx1 - rx0))
-    candidates = []
+    x0, _, x1, _ = roi_bounds(cfg)
+    roi_center = (x0 + x1) * 0.5
+    roi_half_width = max((x1 - x0) * 0.5, 1.0)
+    result: List[Line] = []
+    # reshape(-1, 4) handles both OpenCV return layouts: N x 1 x 4 and N x 4.
     for packed in np.asarray(raw).reshape(-1, 4):
-        x1, y1, x2, y2 = (float(v) for v in packed)
-        if x2 < x1:
-            x1, x2, y1, y2 = x2, x1, y2, y1
-        dx, dy = x2 - x1, y2 - y1
-        length = float(np.hypot(dx, dy))
-        angle = abs(float(np.degrees(np.arctan2(dy, dx))))
-        if angle > cfg.max_angle_deg:
+        line = Line(*(float(value) for value in packed))
+        angle = abs(float(np.degrees(np.arctan2(
+            line.y2 - line.y1, line.x2 - line.x1
+        ))))
+        if angle > cfg.max_line_angle_deg:
             continue
-        contrast = contrast_across_line(gray, x1, y1, x2, y2)
-        angle_factor = max(0.0, 1.0 - angle / cfg.max_angle_deg)
-        center_factor = max(0.35, 1.0 - abs((x1 + x2) / 2 - roi_center) / roi_width)
-        contrast_factor = 1.0 + min(contrast / 50.0, 1.0) * 0.30
-        score = length * (0.60 + 0.40 * angle_factor) * center_factor * contrast_factor
-        candidates.append(BoundaryLine(x1, y1, x2, y2, score))
-    return candidates
-
-
-def merge_similar_lines(
-    candidates: Sequence[BoundaryLine], cfg: DetectorConfig
-) -> List[BoundaryLine]:
-    clusters: List[List[BoundaryLine]] = []
-    for line in sorted(candidates, key=lambda item: item.center_y):
-        nearby = [
-            (abs(line.center_y - np.average(
-                [item.center_y for item in cluster],
-                weights=[item.score for item in cluster],
-            )), cluster)
-            for cluster in clusters
-        ]
-        nearby = [item for item in nearby if item[0] <= cfg.merge_y_px]
-        (min(nearby, key=lambda item: item[0])[1] if nearby else clusters.append([line]))
-        if nearby:
-            min(nearby, key=lambda item: item[0])[1].append(line)
-
-    merged = []
-    for cluster in clusters:
-        weights = np.array([line.score for line in cluster], np.float64)
-        weights /= max(float(weights.sum()), 1e-9)
-        center_y = float(sum(line.center_y * weight for line, weight in zip(cluster, weights)))
-        slope = float(sum(line.slope * weight for line, weight in zip(cluster, weights)))
-        x1, x2 = min(line.x1 for line in cluster), max(line.x2 for line in cluster)
-        if x2 - x1 < cfg.width * cfg.min_final_length_ratio:
-            continue
-        center_x = (x1 + x2) / 2
-        y1, y2 = center_y + slope * (x1 - center_x), center_y + slope * (x2 - center_x)
-        score = sum(line.score for line in cluster) + 0.25 * (x2 - x1)
-        merged.append(BoundaryLine(x1, y1, x2, y2, float(score)))
-    return merged
-
-
-def horizontal_overlap_ratio(a: BoundaryLine, b: BoundaryLine) -> float:
-    overlap = max(0.0, min(a.x2, b.x2) - max(a.x1, b.x1))
-    return overlap / max(1.0, min(a.length_x, b.length_x))
-
-
-def crop_line_to_x_range(line: BoundaryLine, left: float, right: float) -> BoundaryLine:
-    slope = (line.y2 - line.y1) / max(line.x2 - line.x1, 1e-6)
-    return BoundaryLine(
-        left,
-        line.y1 + slope * (left - line.x1),
-        right,
-        line.y1 + slope * (right - line.x1),
-        line.score,
-    )
-
-
-def center_crop_line(
-    line: BoundaryLine, max_length_px: Optional[float]
-) -> BoundaryLine:
-    if not max_length_px or max_length_px <= 0 or line.length_x <= max_length_px:
-        return line
-    center = (line.x1 + line.x2) / 2
-    return crop_line_to_x_range(
-        line, center - max_length_px / 2, center + max_length_px / 2
-    )
-
-
-def make_vertical_gradient_image(color_bgr: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.createCLAHE(2.0, (8, 8)).apply(gray)
-    gray = cv2.GaussianBlur(gray, (5, 5), 1.0)
-    return np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
-
-
-def region_edge_density(
-    gradient: np.ndarray,
-    x0: int,
-    y0: int,
-    x1: int,
-    y1: int,
-    threshold: float,
-) -> Optional[float]:
-    height, width = gradient.shape
-    x0, x1 = int(np.clip(x0, 0, width)), int(np.clip(x1, 0, width))
-    y0, y1 = int(np.clip(y0, 0, height)), int(np.clip(y1, 0, height))
-    if x1 <= x0 or y1 <= y0:
-        return None
-    return float(np.mean(gradient[y0:y1, x0:x1] >= threshold))
-
-
-def floor_visible_below_pair(
-    gradient: np.ndarray, pair: BoundaryPair, cfg: DetectorConfig
-) -> bool:
-    lower = pair[1]
-    roi_x0, _, roi_x1, roi_y1 = roi_pixels(cfg)
-    line_y = round(lower.center_y)
-    y0 = line_y + cfg.floor_band_start_px
-    y1 = min(line_y + cfg.floor_band_end_px, roi_y1, gradient.shape[0])
-    if y1 - y0 < cfg.floor_min_visible_band_px:
-        return False
-
-    trim = max(4, round(lower.length_x * 0.08))
-    density = region_edge_density(
-        gradient,
-        round(lower.x1) + trim,
-        y0,
-        round(lower.x2) - trim,
-        y1,
-        cfg.floor_vertical_gradient_threshold,
-    )
-    if density is None or density > cfg.floor_max_edge_density:
-        return False
-
-    sides = []
-    left_end = round(lower.x1) - cfg.floor_side_gap_px
-    right_start = round(lower.x2) + cfg.floor_side_gap_px
-    side_ranges = []
-    if left_end - roi_x0 >= cfg.floor_min_side_width_px:
-        side_ranges.append((roi_x0, left_end))
-    if roi_x1 - right_start >= cfg.floor_min_side_width_px:
-        side_ranges.append((right_start, roi_x1))
-    for x0, x1 in side_ranges:
-        value = region_edge_density(
-            gradient, x0, y0, x1, y1, cfg.floor_vertical_gradient_threshold
+        contrast = contrast_across_line(gray, line)
+        angle_factor = 1.0 - angle / max(cfg.max_line_angle_deg, 1e-6)
+        center_factor = max(
+            0.35, 1.0 - abs(line.center_x - roi_center) / roi_half_width
         )
-        if value is not None:
-            sides.append(value)
-    return not sides or density <= min(sides) + cfg.floor_max_density_over_reference
+        line.score = (
+            line.length_x
+            * (0.65 + 0.35 * angle_factor)
+            * center_factor
+            * (1.0 + min(contrast / 45.0, 1.0) * 0.35)
+        )
+        result.append(line)
+    return result
 
 
-def select_final_pair(
-    lines: Sequence[BoundaryLine],
-    cfg: DetectorConfig,
-    vertical_gradient: Optional[np.ndarray] = None,
-    depth_m: Optional[np.ndarray] = None,
-) -> Optional[BoundaryPair]:
-    best_pair, best_score = None, -float("inf")
-    roi_center = cfg.width * (cfg.roi_left + cfg.roi_right) / 2
-    _, roi_y0, _, roi_y1 = roi_pixels(cfg)
-    roi_width = cfg.width * (cfg.roi_right - cfg.roi_left)
-    roi_height = max(1.0, float(roi_y1 - roi_y0))
-    max_slope_delta = max(1e-6, 2 * np.tan(np.radians(cfg.max_angle_deg)))
-
-    for i, first in enumerate(lines[:-1]):
-        for second in lines[i + 1 :]:
-            upper, lower = sorted((first, second), key=lambda line: line.center_y)
-            gap = lower.center_y - upper.center_y
-            overlap = horizontal_overlap_ratio(upper, lower)
-            if not cfg.min_boundary_gap_px <= gap <= cfg.max_boundary_gap_px:
-                continue
-            if lower.center_y < cfg.height * cfg.min_lower_boundary_y_ratio:
-                continue
-            if overlap < cfg.min_pair_overlap_ratio:
-                continue
-
-            left, right = max(upper.x1, lower.x1), min(upper.x2, lower.x2)
-            common_width = right - left
-            if common_width < roi_width * cfg.min_pair_common_width_ratio_of_roi:
-                continue
-            pair = (
-                crop_line_to_x_range(upper, left, right),
-                crop_line_to_x_range(lower, left, right),
-            )
-            longest = max(upper.length_x, lower.length_x, 1.0)
-            length_similarity = min(upper.length_x, lower.length_x) / longest
-            center_factor = max(0.0, 1.0 - abs((left + right) / 2 - roi_center) / (cfg.width / 2))
-            support_alignment = common_width / longest
-            x_alignment = max(0.0, 1.0 - abs(upper.center_x - lower.center_x) / roi_width)
-            slope_alignment = max(0.0, 1.0 - abs(upper.slope - lower.slope) / max_slope_delta)
-            lower_factor = float(np.clip((lower.center_y - roi_y0) / roi_height, 0.0, 1.0))
-            score = (
-                upper.score
-                + lower.score
-                + 180 * overlap
-                + 240 * length_similarity
-                + 140 * support_alignment
-                + 90 * x_alignment
-                + 80 * slope_alignment
-                + 120 * lower_factor
-                + 70 * center_factor
-            )
-            if vertical_gradient is not None and floor_visible_below_pair(
-                vertical_gradient, (upper, lower), cfg
-            ):
-                score += cfg.floor_preference_bonus
-            if depth_m is not None:
-                valid, total = face_plane_support(depth_m, pair, cfg)
-                if valid < cfg.height_min_valid_samples:
-                    continue
-                score += 200.0 * valid / max(total, 1)
-            if score > best_score:
-                best_pair, best_score = pair, score
-    return best_pair
+def horizontal_gap(a: Line, b: Line) -> float:
+    if a.x2 < b.x1:
+        return b.x1 - a.x2
+    if b.x2 < a.x1:
+        return a.x1 - b.x2
+    return 0.0
 
 
-def detect_boundary_pair(
-    color_bgr: np.ndarray,
-    cfg: DetectorConfig,
-    depth_m: Optional[np.ndarray] = None,
-) -> Optional[BoundaryPair]:
-    lines = merge_similar_lines(find_horizontal_candidates(color_bgr, cfg), cfg)
-    return select_final_pair(
-        lines, cfg, make_vertical_gradient_image(color_bgr), depth_m
+def merge_cluster(lines: Sequence[Line]) -> Line:
+    weights = np.asarray([max(line.score, 1.0) for line in lines], np.float64)
+    weights /= float(weights.sum())
+    anchor_x = float(sum(line.center_x * w for line, w in zip(lines, weights)))
+    anchor_y = float(sum(line.y_at(anchor_x) * w for line, w in zip(lines, weights)))
+    slope = float(sum(line.slope * w for line, w in zip(lines, weights)))
+    left = min(line.x1 for line in lines)
+    right = max(line.x2 for line in lines)
+    score = float(sum(line.score for line in lines) + 0.20 * (right - left))
+    return Line(
+        left,
+        anchor_y + slope * (left - anchor_x),
+        right,
+        anchor_y + slope * (right - anchor_x),
+        score,
     )
 
 
-class BoundaryTracker:
-    def __init__(self, cfg: DetectorConfig) -> None:
-        self.cfg = cfg
-        self.reset()
+def lines_can_merge(a: Line, b: Line, cfg: Config) -> bool:
+    if horizontal_gap(a, b) > cfg.merge_x_gap_px:
+        return False
+    if abs(a.slope - b.slope) > cfg.merge_slope_delta:
+        return False
+    overlap_left = max(a.x1, b.x1)
+    overlap_right = min(a.x2, b.x2)
+    if overlap_right >= overlap_left:
+        reference_x = (overlap_left + overlap_right) * 0.5
+    elif a.x2 < b.x1:
+        reference_x = (a.x2 + b.x1) * 0.5
+    else:
+        reference_x = (b.x2 + a.x1) * 0.5
+    return abs(a.y_at(reference_x) - b.y_at(reference_x)) <= cfg.merge_y_px
 
-    def reset(self) -> None:
-        self.pending = self.confirmed = None
-        self.consecutive = self.missed = 0
 
-    @staticmethod
-    def _pair_array(pair: BoundaryPair) -> np.ndarray:
-        return np.stack([line.as_array() for line in pair])
-
-    @staticmethod
-    def _center_ys(values: np.ndarray) -> np.ndarray:
-        return (values[:, 1] + values[:, 3]) / 2
-
-    def _error(self, current: np.ndarray, saved: np.ndarray) -> float:
-        return float(np.max(np.abs(self._center_ys(current) - self._center_ys(saved))))
-
-    def update(self, pair: Optional[BoundaryPair]) -> Optional[BoundaryPair]:
-        if pair is None:
-            self.missed += 1
-            self.pending, self.consecutive = None, 0
-            if self.missed > self.cfg.max_missed_frames:
-                self.reset()
-            return self._confirmed_pair()
-
-        current = self._pair_array(pair)
-        if self.confirmed is not None:
-            if self._error(current, self.confirmed) <= self.cfg.tracking_tolerance_px:
-                alpha = self.cfg.smoothing_alpha
-                self.confirmed = (1 - alpha) * self.confirmed + alpha * current
-                self.pending = self.confirmed.copy()
-                self.consecutive, self.missed = self.cfg.confirm_frames, 0
-                return self._confirmed_pair()
-            self.missed += 1
+def merge_similar_lines(lines: Sequence[Line], cfg: Config) -> List[Line]:
+    clusters: List[List[Line]] = []
+    for line in sorted(lines, key=lambda item: item.score, reverse=True):
+        match_index: Optional[int] = None
+        best_distance = float("inf")
+        for index, cluster in enumerate(clusters):
+            representative = merge_cluster(cluster)
+            if not lines_can_merge(line, representative, cfg):
+                continue
+            distance = abs(line.center_y - representative.center_y)
+            if distance < best_distance:
+                match_index, best_distance = index, distance
+        if match_index is None:
+            clusters.append([line])
         else:
-            self.missed = 0
+            clusters[match_index].append(line)
 
-        if self.pending is None or self._error(current, self.pending) > self.cfg.tracking_tolerance_px:
-            self.pending, self.consecutive = current, 1
-        else:
-            alpha = self.cfg.smoothing_alpha
-            self.pending = (1 - alpha) * self.pending + alpha * current
-            self.consecutive += 1
-        if self.consecutive >= self.cfg.confirm_frames:
-            self.confirmed, self.missed = self.pending.copy(), 0
-        elif self.missed > self.cfg.max_missed_frames:
-            self.reset()
-        return self._confirmed_pair()
-
-    def _confirmed_pair(self) -> Optional[BoundaryPair]:
-        if self.confirmed is None:
-            return None
-        return tuple(BoundaryLine.from_array(line) for line in self.confirmed)
+    merged = [merge_cluster(cluster) for cluster in clusters]
+    merged = [
+        line for line in merged if line.length_x >= cfg.min_boundary_length_px
+    ]
+    return sorted(merged, key=lambda item: item.score, reverse=True)[
+        : cfg.max_merged_lines
+    ]
 
 
-def pair_pixel_gap(pair: BoundaryPair) -> float:
-    return pair[1].center_y - pair[0].center_y
-
-
-def line_y_at_x(line: BoundaryLine, x: float) -> float:
-    return line.y1 + line.slope * (x - line.x1)
+def overlap_ratio(a: Line, b: Line) -> float:
+    common = max(0.0, min(a.x2, b.x2) - max(a.x1, b.x1))
+    return common / max(min(a.length_x, b.length_x), 1.0)
 
 
 def depth_patch_median(
-    depth_m: np.ndarray, x: float, y: float, cfg: DetectorConfig
+    depth_m: np.ndarray, x: float, y: float, cfg: Config
 ) -> Optional[float]:
-    """Return a robust depth from a small patch fully inside the step face."""
-    radius = cfg.height_patch_radius_px
+    radius = cfg.depth_patch_radius_px
     cx, cy = round(x), round(y)
     x0, x1 = max(0, cx - radius), min(depth_m.shape[1], cx + radius + 1)
     y0, y1 = max(0, cy - radius), min(depth_m.shape[0], cy + radius + 1)
+    if x1 <= x0 or y1 <= y0:
+        return None
     patch = depth_m[y0:y1, x0:x1]
     valid = patch[
         np.isfinite(patch)
         & (patch >= cfg.depth_min_m)
         & (patch <= cfg.depth_max_m)
     ]
-    return float(np.median(valid)) if valid.size >= 5 else None
+    return float(np.median(valid)) if valid.size >= 3 else None
 
 
-def face_column_depth_m(
+def sample_z_columns(
     depth_m: np.ndarray,
-    pair: BoundaryPair,
-    x: float,
-    cfg: DetectorConfig,
-) -> Optional[float]:
-    """Return one face depth only when upper/middle/lower samples agree."""
-    upper_y = line_y_at_x(pair[0], x)
-    lower_y = line_y_at_x(pair[1], x)
-    usable_top = upper_y + cfg.height_edge_inset_px
-    usable_bottom = lower_y - cfg.height_edge_inset_px
-    if usable_bottom - usable_top <= 2 * cfg.height_patch_radius_px:
-        return None
+    line: Line,
+    left: float,
+    right: float,
+    side: int,
+    offsets: Iterable[int],
+    samples: int,
+    cfg: Config,
+) -> np.ndarray:
+    values: List[float] = []
+    for x in np.linspace(left, right, samples):
+        depths = [
+            depth_patch_median(depth_m, x, line.y_at(float(x)) + side * offset, cfg)
+            for offset in offsets
+        ]
+        depths = [value for value in depths if value is not None]
+        if depths:
+            values.append(float(np.median(depths)))
+    return np.asarray(values, np.float64)
 
-    depths = [
-        depth_patch_median(
-            depth_m,
-            x,
-            usable_top + fraction * (usable_bottom - usable_top),
-            cfg,
-        )
-        for fraction in cfg.height_face_depth_fractions
+
+def sample_face_layer_z(
+    depth_m: np.ndarray,
+    upper: Line,
+    lower: Line,
+    left: float,
+    right: float,
+    fraction: float,
+    cfg: Config,
+) -> np.ndarray:
+    values: List[float] = []
+    for x in np.linspace(left, right, cfg.evidence_x_samples):
+        upper_y = upper.y_at(float(x))
+        lower_y = lower.y_at(float(x))
+        y = upper_y + fraction * (lower_y - upper_y)
+        value = depth_patch_median(depth_m, x, y, cfg)
+        if value is not None:
+            values.append(value)
+    return np.asarray(values, np.float64)
+
+
+def assess_pair_depth(
+    depth_m: np.ndarray, pair: BoundaryPair, cfg: Config
+) -> PairEvidence:
+    upper, lower = pair
+    left = max(upper.x1, lower.x1) + cfg.height_x_inset_px
+    right = min(upper.x2, lower.x2) - cfg.height_x_inset_px
+    nan = float("nan")
+    if right <= left:
+        return PairEvidence(0, nan, nan, nan, nan, nan, nan, 0, 0, 0)
+
+    top = sample_z_columns(
+        depth_m, upper, left, right, -1, cfg.evidence_offsets_px,
+        cfg.evidence_x_samples, cfg,
+    )
+    floor = sample_z_columns(
+        depth_m, lower, left, right, +1, cfg.evidence_offsets_px,
+        cfg.evidence_x_samples, cfg,
+    )
+    face_layers = [
+        sample_face_layer_z(depth_m, upper, lower, left, right, fraction, cfg)
+        for fraction in (0.18, 0.50, 0.82)
     ]
-    if any(value is None for value in depths):
+    face_medians = [
+        float(np.median(values))
+        for values in face_layers
+        if values.size >= cfg.evidence_min_valid_columns
+    ]
+    top_z = float(np.median(top)) if top.size else nan
+    floor_z = float(np.median(floor)) if floor.size else nan
+    face_z = float(np.median(face_medians)) if face_medians else nan
+    face_delta = (
+        float(max(face_medians) - min(face_medians))
+        if len(face_medians) == 3 else float("inf")
+    )
+
+    enough = (
+        top.size >= cfg.evidence_min_valid_columns
+        and floor.size >= cfg.evidence_min_valid_columns
+        and len(face_medians) == 3
+    )
+    if enough:
+        # Absolute transitions keep the same detector usable for an up- or
+        # down-step. Height itself is still calculated only from 3D Y medians.
+        upper_transition = abs(top_z - face_medians[0])
+        lower_transition = abs(face_medians[-1] - floor_z)
+        upper_ok = upper_transition >= cfg.evidence_min_transition_m
+        lower_ok = lower_transition >= cfg.evidence_min_transition_m
+        face_ok = face_delta <= cfg.evidence_max_face_layer_delta_m
+        if upper_ok and lower_ok and face_ok:
+            tier = 3
+        elif upper_ok and lower_ok:
+            tier = 2
+        elif (upper_ok or lower_ok) and face_ok:
+            tier = 1
+        else:
+            tier = 0
+    else:
+        upper_transition = lower_transition = nan
+        tier = 0
+
+    face_valid = min((values.size for values in face_layers), default=0)
+    return PairEvidence(
+        tier=tier,
+        top_z_m=top_z,
+        face_z_m=face_z,
+        floor_z_m=floor_z,
+        upper_transition_m=float(upper_transition),
+        lower_transition_m=float(lower_transition),
+        face_layer_delta_m=face_delta,
+        top_valid=int(top.size),
+        face_valid=int(face_valid),
+        floor_valid=int(floor.size),
+    )
+
+
+def pair_geometry(
+    first: Line, second: Line, cfg: Config
+) -> Optional[Tuple[BoundaryPair, float]]:
+    upper, lower = sorted((first, second), key=lambda line: line.center_y)
+    left, right = max(upper.x1, lower.x1), min(upper.x2, lower.x2)
+    common_width = right - left
+    if common_width < cfg.min_common_width_px:
         return None
-    values = np.asarray(depths, np.float64)
-    if float(np.ptp(values)) > cfg.height_max_edge_depth_delta_m + 1e-9:
+    if overlap_ratio(upper, lower) < cfg.min_overlap_ratio:
         return None
-    return float(np.median(values))
+    if abs(upper.slope - lower.slope) > cfg.max_pair_slope_delta:
+        return None
+
+    center_x = (left + right) * 0.5
+    gap = lower.y_at(center_x) - upper.y_at(center_x)
+    if not cfg.min_boundary_gap_px <= gap <= cfg.max_boundary_gap_px:
+        return None
+
+    _, roi_y0, _, roi_y1 = roi_bounds(cfg)
+    minimum_lower_y = roi_y0 + cfg.min_lower_position_in_roi * (roi_y1 - roi_y0)
+    if lower.y_at(center_x) < minimum_lower_y:
+        return None
+    if roi_y1 - lower.y_at(center_x) < cfg.min_space_below_lower_px:
+        return None
+
+    upper = upper.crop(left, right)
+    lower = lower.crop(left, right)
+    length_similarity = min(first.length_x, second.length_x) / max(
+        first.length_x, second.length_x, 1.0
+    )
+    slope_similarity = max(
+        0.0, 1.0 - abs(upper.slope - lower.slope) / cfg.max_pair_slope_delta
+    )
+    rgb_score = (
+        first.score + second.score
+        + 1.8 * common_width
+        + 120.0 * length_similarity
+        + 90.0 * slope_similarity
+    )
+    return (upper, lower), float(rgb_score)
 
 
-def face_plane_support(
-    depth_m: np.ndarray, pair: BoundaryPair, cfg: DetectorConfig
-) -> Tuple[int, int]:
-    """Count columns whose face Depth variation is at most 1 cm."""
-    left, right = max(pair[0].x1, pair[1].x1), min(pair[0].x2, pair[1].x2)
-    trim = max(6.0, (right - left) * 0.08)
-    if right - left <= 2 * trim:
-        return 0, cfg.height_x_samples
-    xs = np.linspace(left + trim, right - trim, cfg.height_x_samples)
-    valid = sum(face_column_depth_m(depth_m, pair, x, cfg) is not None for x in xs)
-    return valid, len(xs)
+def detect_boundary_pair(
+    color_bgr: np.ndarray, depth_m: np.ndarray, cfg: Config
+) -> Tuple[Optional[BoundaryPair], Optional[PairEvidence]]:
+    lines = merge_similar_lines(find_horizontal_lines(color_bgr, cfg), cfg)
+    best_pair: Optional[BoundaryPair] = None
+    best_evidence: Optional[PairEvidence] = None
+    best_rank = (-1, -float("inf"))
+
+    for index, first in enumerate(lines[:-1]):
+        for second in lines[index + 1:]:
+            geometry = pair_geometry(first, second, cfg)
+            if geometry is None:
+                continue
+            pair, rgb_score = geometry
+            evidence = assess_pair_depth(depth_m, pair, cfg)
+            if evidence.tier < cfg.min_evidence_tier:
+                continue
+            transition_score = 0.0
+            if np.isfinite(evidence.upper_transition_m):
+                transition_score += min(evidence.upper_transition_m, 0.08) * 2500.0
+            if np.isfinite(evidence.lower_transition_m):
+                transition_score += min(evidence.lower_transition_m, 0.08) * 2500.0
+            rank = (evidence.tier, rgb_score + transition_score)
+            if rank > best_rank:
+                best_pair, best_evidence, best_rank = pair, evidence, rank
+    return best_pair, best_evidence
 
 
-def measure_step_face_height(
+def pair_array(pair: BoundaryPair) -> np.ndarray:
+    return np.stack((pair[0].as_array(), pair[1].as_array()))
+
+
+def pair_from_array(values: np.ndarray) -> BoundaryPair:
+    return Line.from_array(values[0]), Line.from_array(values[1])
+
+
+def pair_is_close(a: np.ndarray, b: np.ndarray, cfg: Config) -> bool:
+    pair_a = pair_from_array(a)
+    pair_b = pair_from_array(b)
+
+    # Hough 선분의 X 시작·끝 위치가 달라도
+    # ROI 중앙에서 같은 경계선인지 비교
+    roi_x0, _, roi_x1, _ = roi_bounds(cfg)
+    reference_x = (roi_x0 + roi_x1) * 0.5
+
+    a_y = np.asarray(
+        [line.y_at(reference_x) for line in pair_a],
+        dtype=np.float64,
+    )
+    b_y = np.asarray(
+        [line.y_at(reference_x) for line in pair_b],
+        dtype=np.float64,
+    )
+
+    a_mid_y = float(np.mean(a_y))
+    b_mid_y = float(np.mean(b_y))
+
+    a_gap = float(a_y[1] - a_y[0])
+    b_gap = float(b_y[1] - b_y[0])
+
+    slope_delta = max(
+        abs(pair_a[0].slope - pair_b[0].slope),
+        abs(pair_a[1].slope - pair_b[1].slope),
+    )
+
+    return (
+        abs(a_mid_y - b_mid_y) <= cfg.boundary_y_tolerance_px
+        and abs(a_gap - b_gap) <= cfg.boundary_gap_tolerance_px
+        and slope_delta <= cfg.boundary_slope_tolerance
+    )
+
+
+class BoundaryTracker:
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self.history: Deque[Optional[np.ndarray]] = deque(
+            maxlen=cfg.boundary_window_frames
+        )
+        self.confirmed: Optional[np.ndarray] = None
+        self.missed = 0
+
+    def reset(self) -> None:
+        self.history.clear()
+        self.confirmed = None
+        self.missed = 0
+
+    def update(self, pair: Optional[BoundaryPair]) -> Optional[BoundaryPair]:
+        current = pair_array(pair) if pair is not None else None
+        self.history.append(current)
+
+        if current is None:
+            self.missed += 1
+            if self.missed > self.cfg.max_missed_frames:
+                self.reset()
+            return pair_from_array(self.confirmed) if self.confirmed is not None else None
+
+        self.missed = 0
+        consistent = [
+            saved for saved in self.history
+            if saved is not None and pair_is_close(current, saved, self.cfg)
+        ]
+        if len(consistent) >= self.cfg.boundary_required_frames:
+            voted = np.median(np.stack(consistent), axis=0)
+            if self.confirmed is None or not pair_is_close(voted, self.confirmed, self.cfg):
+                self.confirmed = voted
+            else:
+                alpha = self.cfg.boundary_smoothing_alpha
+                self.confirmed = (1.0 - alpha) * self.confirmed + alpha * voted
+        return pair_from_array(self.confirmed) if self.confirmed is not None else None
+
+    def current_matches(self, pair: Optional[BoundaryPair]) -> bool:
+        return (
+            pair is not None
+            and self.confirmed is not None
+            and pair_is_close(pair_array(pair), self.confirmed, self.cfg)
+        )
+
+
+def robust_surface_mask(values: np.ndarray, cfg: Config) -> np.ndarray:
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return finite
+    center = float(np.median(values[finite]))
+    spread = robust_mad(values[finite])
+    tolerance = max(
+        cfg.surface_outlier_min_tolerance_m,
+        cfg.surface_outlier_mad_scale * spread,
+    )
+    return finite & (np.abs(values - center) <= tolerance)
+
+
+def sample_surface_xyz(
+    depth_m: np.ndarray,
+    line: Line,
+    xs: np.ndarray,
+    side: int,
+    deproject: Deproject,
+    cfg: Config,
+) -> Optional[SurfaceStats]:
+    y_columns = np.full(xs.shape, np.nan, np.float64)
+    z_columns = np.full(xs.shape, np.nan, np.float64)
+
+    for index, x in enumerate(xs):
+        y_values: List[float] = []
+        z_values: List[float] = []
+        boundary_y = line.y_at(float(x))
+        for offset in cfg.height_band_offsets_px:
+            pixel_y = boundary_y + side * offset
+            depth = depth_patch_median(depth_m, float(x), pixel_y, cfg)
+            if depth is None:
+                continue
+            point = np.asarray(
+                deproject((float(x), float(pixel_y)), float(depth)), np.float64
+            )
+            if point.size < 3 or not np.all(np.isfinite(point[:3])):
+                continue
+            # D435 optical coordinates: +Y points downward. With the camera
+            # mounted level, this is the vertical coordinate requested here.
+            y_values.append(float(point[1]))
+            z_values.append(float(point[2]))
+        if len(y_values) >= 3:
+            y_columns[index] = float(np.median(y_values))
+            z_columns[index] = float(np.median(z_values))
+
+    keep = robust_surface_mask(y_columns, cfg)
+    if int(np.count_nonzero(keep)) < cfg.height_min_valid_columns:
+        return None
+    y_columns[~keep] = np.nan
+    z_columns[~keep] = np.nan
+    valid_y = y_columns[keep]
+    valid_z = z_columns[keep]
+    return SurfaceStats(
+        median_y_m=float(np.median(valid_y)),
+        median_z_m=float(np.median(valid_z)),
+        spread_y_m=robust_mad(valid_y),
+        valid_columns=int(valid_y.size),
+        y_by_column=y_columns,
+    )
+
+
+def measure_height_from_two_boundaries(
     depth_m: np.ndarray,
     pair: Optional[BoundaryPair],
     deproject: Deproject,
-    cfg: DetectorConfig,
+    cfg: Config,
+    evidence: Optional[PairEvidence] = None,
 ) -> Optional[HeightMeasurement]:
-    """Measure the vertical 3D Y difference across one step's front face.
-
-    Upper, middle, and lower inset samples must agree within 1 cm. Their median
-    face depth is applied to both actual boundary coordinates, so Z difference
-    cannot be added to the reported height.
-    """
+    """Return abs(median(Y_lower) - median(Y_upper)); nothing else."""
     if pair is None or depth_m.ndim != 2:
         return None
-
     upper, lower = pair
-    left, right = max(upper.x1, lower.x1), min(upper.x2, lower.x2)
-    trim = max(6.0, (right - left) * 0.08)
-    if right - left <= 2 * trim:
+    left = max(upper.x1, lower.x1) + cfg.height_x_inset_px
+    right = min(upper.x2, lower.x2) - cfg.height_x_inset_px
+    if right <= left:
         return None
 
-    heights, distances = [], []
-    xs = np.linspace(left + trim, right - trim, cfg.height_x_samples)
-    for x in xs:
-        upper_y, lower_y = line_y_at_x(upper, x), line_y_at_x(lower, x)
-        if lower_y - upper_y <= 2 * (
-            cfg.height_edge_inset_px + cfg.height_patch_radius_px
-        ):
-            continue
-
-        face_z = face_column_depth_m(depth_m, pair, x, cfg)
-        if face_z is None:
-            continue
-
-        upper_3d = np.asarray(deproject((float(x), upper_y), face_z), np.float64)
-        lower_3d = np.asarray(deproject((float(x), lower_y), face_z), np.float64)
-        if upper_3d.size < 2 or lower_3d.size < 2:
-            continue
-        height = abs(float(lower_3d[1] - upper_3d[1]))
-        if np.isfinite(height) and cfg.height_min_m <= height <= cfg.height_max_m:
-            heights.append(height)
-            distances.append(face_z)
-
-    if len(heights) < cfg.height_min_valid_samples:
+    xs = np.linspace(left, right, cfg.height_x_samples)
+    upper_surface = sample_surface_xyz(
+        depth_m, upper, xs, -1, deproject, cfg
+    )
+    lower_surface = sample_surface_xyz(
+        depth_m, lower, xs, +1, deproject, cfg
+    )
+    if upper_surface is None or lower_surface is None:
+        return None
+    if (
+        upper_surface.spread_y_m > cfg.surface_max_y_spread_m
+        or lower_surface.spread_y_m > cfg.surface_max_y_spread_m
+    ):
         return None
 
-    values = np.asarray(heights)
-    median = float(np.median(values))
-    deviation = np.abs(values - median)
-    mad = float(np.median(deviation))
-    if mad > 1e-6:
-        keep = deviation <= cfg.height_mad_scale * 1.4826 * mad
-        values = values[keep]
-        distances = np.asarray(distances)[keep]
-    else:
-        distances = np.asarray(distances)
-    if values.size < cfg.height_min_valid_samples:
+    # This is the requested height equation. No RGB pixel-gap conversion,
+    # common face Z, plane fitting, or face-height approximation is used.
+    signed_height = lower_surface.median_y_m - upper_surface.median_y_m
+    raw_height = abs(signed_height)
+    if not cfg.height_min_m <= raw_height <= cfg.height_max_m:
         return None
 
-    raw = float(np.median(values))
-    spread = float(1.4826 * np.median(np.abs(values - raw)))
+    paired_mask = (
+        np.isfinite(upper_surface.y_by_column)
+        & np.isfinite(lower_surface.y_by_column)
+    )
+    paired_heights = np.abs(
+        lower_surface.y_by_column[paired_mask]
+        - upper_surface.y_by_column[paired_mask]
+    )
+    if paired_heights.size < cfg.height_min_paired_columns:
+        return None
+    column_spread = robust_mad(paired_heights)
+    if column_spread > cfg.height_max_column_spread_m:
+        return None
+
+    front_z = (
+        evidence.face_z_m
+        if evidence is not None and np.isfinite(evidence.face_z_m)
+        else float(np.median((upper_surface.median_z_m, lower_surface.median_z_m)))
+    )
+    if not cfg.depth_min_m <= front_z <= cfg.depth_max_m:
+        return None
+
     return HeightMeasurement(
-        raw, raw, float(np.median(distances)), spread, int(values.size), len(xs)
+        height_m=raw_height,
+        raw_height_m=raw_height,
+        signed_height_m=float(signed_height),
+        upper_y_m=upper_surface.median_y_m,
+        lower_y_m=lower_surface.median_y_m,
+        front_z_m=float(front_z),
+        upper_valid=upper_surface.valid_columns,
+        lower_valid=lower_surface.valid_columns,
+        paired_valid=int(paired_heights.size),
+        total_columns=cfg.height_x_samples,
+        column_spread_m=float(column_spread),
     )
 
 
 class HeightTracker:
-    def __init__(self, cfg: DetectorConfig) -> None:
+    def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.history: Deque[float] = deque(maxlen=cfg.height_history_frames)
         self.missed = 0
@@ -620,6 +818,10 @@ class HeightTracker:
     def reset(self) -> None:
         self.history.clear()
         self.missed = 0
+
+    @property
+    def valid_frames(self) -> int:
+        return len(self.history)
 
     def update(
         self, measurement: Optional[HeightMeasurement]
@@ -631,66 +833,112 @@ class HeightTracker:
             return None
 
         self.missed = 0
-        if self.history and abs(
-            measurement.raw_height_m - float(np.median(self.history))
-        ) > self.cfg.height_history_reset_cm / 100:
-            self.history.clear()
+        if self.history:
+            previous = float(np.median(self.history))
+            if abs(measurement.raw_height_m - previous) > self.cfg.height_history_reset_m:
+                self.history.clear()
         self.history.append(measurement.raw_height_m)
-        return replace(measurement, height_m=float(np.median(self.history)))
+        if len(self.history) < self.cfg.height_required_frames:
+            return None
+
+        values = np.asarray(self.history, np.float64)
+        temporal_spread = robust_mad(values)
+        if temporal_spread > self.cfg.height_max_temporal_spread_m:
+            return None
+        return replace(
+            measurement,
+            height_m=float(np.median(values)),
+            temporal_spread_m=float(temporal_spread),
+        )
 
 
-def _outlined_text(
-    image: np.ndarray,
-    text: str,
-    position: Tuple[int, int],
-    scale: float,
-    color: Tuple[int, int, int],
-    outline: int = 5,
-) -> None:
-    cv2.putText(image, text, position, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), outline, cv2.LINE_AA)
-    cv2.putText(image, text, position, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
+def center_crop_line(line: Line, max_length: float) -> Line:
+    if line.length_x <= max_length:
+        return line
+    center = line.center_x
+    return line.crop(center - max_length * 0.5, center + max_length * 0.5)
 
 
-def draw_final_result(
+def draw_result(
     color_bgr: np.ndarray,
     pair: Optional[BoundaryPair],
-    status: str = STATUS_SEARCHING,
-    max_line_length_px: Optional[float] = None,
-    measurement: Optional[HeightMeasurement] = None,
+    raw_measurement: Optional[HeightMeasurement],
+    stable_measurement: Optional[HeightMeasurement],
+    height_tracker: HeightTracker,
+    cfg: Config,
+    show_roi: bool,
 ) -> np.ndarray:
     display = color_bgr.copy()
-    detail = None
+    if show_roi:
+        x0, y0, x1, y1 = roi_bounds(cfg)
+        cv2.rectangle(display, (x0, y0), (x1, y1), (0, 255, 255), 2)
+        _outlined_text(display, "RGB DETECTION ROI", (x0 + 8, y0 + 24), 0.55, (0, 255, 255))
+
     if pair is None:
-        text, color = status, (255, 255, 255)
+        _outlined_text(display, "SEARCHING: TWO STEP BOUNDARIES", (16, 34), 0.66, (255, 255, 255))
+        return display
+
+    for line, color in zip(pair, ((255, 255, 0), (255, 0, 255))):
+        visible = center_crop_line(line, cfg.display_line_length_px)
+        p1 = (round(visible.x1), round(visible.y1))
+        p2 = (round(visible.x2), round(visible.y2))
+        cv2.line(display, p1, p2, (0, 0, 0), 7, cv2.LINE_AA)
+        cv2.line(display, p1, p2, color, 4, cv2.LINE_AA)
+
+    if stable_measurement is not None:
+        item = stable_measurement
+        _outlined_text(
+            display,
+            f"STEP HEIGHT: {item.height_m * 100:.1f} cm",
+            (16, 34), 0.72, (0, 255, 0),
+        )
+        _outlined_text(
+            display,
+            f"Z: {item.front_z_m * 100:.1f} cm | VALID U/L: "
+            f"{item.upper_valid}/{item.lower_valid} | SPREAD: "
+            f"{item.column_spread_m * 100:.2f} cm",
+            (16, 62), 0.52, (0, 255, 0),
+        )
+    elif raw_measurement is not None:
+        _outlined_text(
+            display,
+            f"STABILIZING HEIGHT: {height_tracker.valid_frames}/"
+            f"{cfg.height_required_frames}",
+            (16, 34), 0.66, (0, 255, 255),
+        )
+        _outlined_text(
+            display,
+            f"RAW: {raw_measurement.raw_height_m * 100:.1f} cm | VALID U/L: "
+            f"{raw_measurement.upper_valid}/{raw_measurement.lower_valid}",
+            (16, 62), 0.52, (0, 255, 255),
+        )
     else:
-        for line, color in zip(pair, ((255, 255, 0), (255, 0, 255))):
-            visible = center_crop_line(line, max_line_length_px)
-            p1 = round(visible.x1), round(visible.y1)
-            p2 = round(visible.x2), round(visible.y2)
-            cv2.line(display, p1, p2, (0, 0, 0), 7, cv2.LINE_AA)
-            cv2.line(display, p1, p2, color, 4, cv2.LINE_AA)
-        color = (0, 255, 0)
-        if measurement is None:
-            text = "STEP FACE DETECTED | WAITING FOR VALID DEPTH"
-            detail = f"PIXEL GAP: {pair_pixel_gap(pair):.1f} px"
-        else:
-            text = f"STEP HEIGHT: {measurement.height_m * 100:.1f} cm"
-            detail = (
-                f"FRONT Z: {measurement.front_distance_m * 100:.1f} cm | "
-                f"VALID: {measurement.valid_samples}/{measurement.total_samples} | "
-                f"SPREAD: {measurement.spread_m * 100:.2f} cm"
-            )
-    _outlined_text(display, text, (18, 34), 0.66, color)
-    if detail:
-        _outlined_text(display, detail, (18, 62), 0.55, color, 4)
+        _outlined_text(
+            display, "TWO BOUNDARIES | DEPTH/HEIGHT NOT VALID",
+            (16, 34), 0.62, (0, 255, 255),
+        )
+        _outlined_text(
+            display,
+            "Need Z 30-100 cm and enough samples in both 8-10 px bands",
+            (16, 62), 0.46, (0, 255, 255),
+        )
     return display
 
 
-def draw_roi_overlay(color_bgr: np.ndarray, cfg: DetectorConfig) -> None:
-    x0, y0, x1, y1 = roi_pixels(cfg)
-    color = (0, 255, 255)
-    cv2.rectangle(color_bgr, (x0, y0), (x1 - 1, y1 - 1), color, 2, cv2.LINE_AA)
-    _outlined_text(color_bgr, "RGB DETECTION ROI", (x0 + 8, y0 + 24), 0.55, color, 4)
+def configure_depth_filters(rs: object) -> Tuple[object, object]:
+    spatial = rs.spatial_filter()
+    temporal = rs.temporal_filter()
+    try:
+        spatial.set_option(rs.option.filter_magnitude, 2)
+        spatial.set_option(rs.option.filter_smooth_alpha, 0.50)
+        spatial.set_option(rs.option.filter_smooth_delta, 20)
+        temporal.set_option(rs.option.filter_smooth_alpha, 0.45)
+        temporal.set_option(rs.option.filter_smooth_delta, 20)
+    except Exception:
+        # Defaults are still safe when an older pyrealsense2 build does not
+        # expose one of the optional settings.
+        pass
+    return spatial, temporal
 
 
 def run_live() -> None:
@@ -698,59 +946,89 @@ def run_live() -> None:
         import pyrealsense2 as rs
     except ImportError as exc:
         raise SystemExit(
-            "pyrealsense2 is required. Run this file where realsense-viewer works."
+            "pyrealsense2 is required. Run this where realsense-viewer works."
         ) from exc
 
-    cfg = DetectorConfig()
-    boundary_tracker, height_tracker, show_roi = (
-        BoundaryTracker(cfg),
-        HeightTracker(cfg),
-        True,
-    )
-    pipeline, stream_cfg = rs.pipeline(), rs.config()
-    stream_cfg.enable_stream(
+    cfg = Config()
+    boundary_tracker = BoundaryTracker(cfg)
+    height_tracker = HeightTracker(cfg)
+    show_roi = True
+
+    pipeline = rs.pipeline()
+    stream_config = rs.config()
+    stream_config.enable_stream(
         rs.stream.depth, cfg.width, cfg.height, rs.format.z16, cfg.fps
     )
-    stream_cfg.enable_stream(
+    stream_config.enable_stream(
         rs.stream.color, cfg.width, cfg.height, rs.format.bgr8, cfg.fps
     )
-    profile = pipeline.start(stream_cfg)
+    profile = pipeline.start(stream_config)
     depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
     align_to_color = rs.align(rs.stream.color)
-    print(f"Detector build: {DETECTOR_BUILD}")
-    print(f"D435 RGB-D step height: {cfg.width}x{cfg.height}@{cfg.fps} FPS")
-    print("q/ESC: quit, r: reset tracking/height, i: show/hide ROI")
+    spatial, temporal = configure_depth_filters(rs)
+
+    print(f"Build: {BUILD}")
+    print(f"D435: {cfg.width}x{cfg.height}@{cfg.fps} FPS")
+    print("Height = abs(median(Y_lower) - median(Y_upper))")
+    print("q/ESC: quit, r: reset, i: show/hide ROI")
+
     try:
         while True:
-            frames = align_to_color.process(pipeline.wait_for_frames())
-            depth_frame = frames.get_depth_frame()
-            color_frame = frames.get_color_frame()
+            aligned = align_to_color.process(pipeline.wait_for_frames())
+            depth_frame = aligned.get_depth_frame()
+            color_frame = aligned.get_color_frame()
             if not depth_frame or not color_frame:
                 continue
+
+            if cfg.use_realsense_filters:
+                depth_frame = spatial.process(depth_frame)
+                depth_frame = temporal.process(depth_frame)
+                depth_frame = depth_frame.as_depth_frame()
+
             color = np.asanyarray(color_frame.get_data())
             depth_m = (
-                np.asanyarray(depth_frame.get_data()).astype(np.float32) * depth_scale
+                np.asanyarray(depth_frame.get_data()).astype(np.float32)
+                * depth_scale
             )
-            pair = detect_boundary_pair(color, cfg, depth_m)
-            confirmed = boundary_tracker.update(pair)
-            intrinsics = depth_frame.profile.as_video_stream_profile().get_intrinsics()
-
-            def deproject(pixel: Tuple[float, float], depth: float) -> Sequence[float]:
-                return rs.rs2_deproject_pixel_to_point(intrinsics, list(pixel), depth)
-
-            measurement = height_tracker.update(
-                measure_step_face_height(depth_m, confirmed, deproject, cfg)
+            intrinsics = (
+                depth_frame.profile.as_video_stream_profile().get_intrinsics()
             )
-            display = draw_final_result(
+
+            def deproject(
+                pixel: Tuple[float, float], depth: float
+            ) -> Sequence[float]:
+                return rs.rs2_deproject_pixel_to_point(
+                    intrinsics, [float(pixel[0]), float(pixel[1])], float(depth)
+                )
+
+            detected, _ = detect_boundary_pair(color, depth_m, cfg)
+            confirmed = boundary_tracker.update(detected)
+            evidence = (
+                assess_pair_depth(depth_m, confirmed, cfg)
+                if confirmed is not None else None
+            )
+            raw_measurement = None
+            if (
+                confirmed is not None
+                and boundary_tracker.current_matches(detected)
+                and evidence is not None
+                and evidence.tier >= cfg.min_evidence_tier
+            ):
+                raw_measurement = measure_height_from_two_boundaries(
+                    depth_m, confirmed, deproject, cfg, evidence
+                )
+            stable_measurement = height_tracker.update(raw_measurement)
+
+            display = draw_result(
                 color,
                 confirmed,
-                STATUS_DETECTED if confirmed or pair else STATUS_SEARCHING,
-                cfg.display_line_length_px,
-                measurement,
+                raw_measurement,
+                stable_measurement,
+                height_tracker,
+                cfg,
+                show_roi,
             )
-            if show_roi:
-                draw_roi_overlay(display, cfg)
-            cv2.imshow("D435 RGB - Final Two Boundaries", display)
+            cv2.imshow("D435 - Two Boundaries Median-Y Height", display)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q")):
                 break
