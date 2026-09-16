@@ -9,6 +9,10 @@ Canny images and Hough candidates are used only internally. The one output
 window always shows the real RGB image and, after temporal confirmation, only
 the final upper/lower boundary pair.
 
+This RGB-only stage does not decide physical distance or ``TOO CLOSE``. Those
+decisions belong to the later aligned-depth stage; a textured floor must not
+erase an otherwise valid RGB boundary pair.
+
 Controls
 --------
 q or ESC : quit
@@ -25,7 +29,7 @@ import cv2
 import numpy as np
 
 
-DETECTOR_BUILD = "RGB848_PARTIAL_V8"
+DETECTOR_BUILD = "RGB848_SOFT_FLOOR_V9"
 
 
 @dataclass(frozen=True)
@@ -37,8 +41,8 @@ class DetectorConfig:
 
     # Temporary lower-central bench-test ROI. Recalibrate these four ratios
     # after the D435 is rigidly mounted on the robot.
-    roi_left: float = 0.25
-    roi_top: float = 0.30
+    roi_left: float = 0.20
+    roi_top: float = 0.35
     roi_right: float = 0.80
     roi_bottom: float = 1.00
 
@@ -73,9 +77,8 @@ class DetectorConfig:
     min_pair_common_width_ratio_of_roi: float = 0.25
     min_lower_boundary_y_ratio: float = 0.50
 
-    # A true lower-front boundary must have a visible floor region below it.
-    # Strong vertical texture continuing below the line indicates that the
-    # selected line is still on the box/top/front face, not the floor contact.
+    # Floor appearance is only a soft preference between geometrically valid
+    # pairs. Wood grain, shadows, or floor texture must never reject a pair.
     floor_band_start_px: int = 8
     floor_band_end_px: int = 40
     # Near 50 cm the real floor-contact edge can approach the ROI bottom.
@@ -86,6 +89,7 @@ class DetectorConfig:
     floor_vertical_gradient_threshold: float = 30.0
     floor_max_edge_density: float = 0.075
     floor_max_density_over_reference: float = 0.060
+    floor_preference_bonus: float = 80.0
 
     # Show a pair only after it stays at nearly the same Y position for five
     # consecutive frames. This suppresses one-frame clutter selections.
@@ -158,7 +162,6 @@ class DetectionResult:
 
 
 STATUS_SEARCHING = "SEARCHING FOR TWO RGB BOUNDARIES"
-STATUS_TOO_CLOSE = "LOWER EDGE NOT VISIBLE / TOO CLOSE"
 STATUS_DETECTED = "RGB BOUNDARIES DETECTED"
 
 
@@ -407,7 +410,7 @@ def floor_visible_below_pair(
     pair: BoundaryPair,
     cfg: DetectorConfig,
 ) -> bool:
-    """Verify that the lower line is followed by a visible floor-like band."""
+    """Return a soft floor-appearance hint; never use it to reject a pair."""
     _, lower = pair
     roi_x0, _, roi_x1, roi_y1 = roi_pixels(cfg)
 
@@ -477,14 +480,13 @@ def select_final_pair(
     lines: Sequence[BoundaryLine],
     cfg: DetectorConfig,
     vertical_gradient: Optional[np.ndarray] = None,
-) -> Tuple[Optional[BoundaryPair], bool]:
+) -> Optional[BoundaryPair]:
     """Select one upper/lower pair and discard every other Hough line."""
     if len(lines) < 2:
-        return None, False
+        return None
 
     best_pair: Optional[BoundaryPair] = None
     best_score = -float("inf")
-    rejected_for_floor = False
     roi_center_x = 0.5 * cfg.width * (cfg.roi_left + cfg.roi_right)
 
     for i in range(len(lines) - 1):
@@ -517,17 +519,6 @@ def select_final_pair(
                 crop_line_to_x_range(upper, common_left, common_right),
                 crop_line_to_x_range(lower, common_left, common_right),
             )
-            # Validate the entire detected lower edge, not only the common
-            # overlap. A short upper fragment can otherwise make a box face
-            # look like a small, locally uniform patch of floor.
-            if vertical_gradient is not None and not floor_visible_below_pair(
-                vertical_gradient,
-                (upper, lower),
-                cfg,
-            ):
-                rejected_for_floor = True
-                continue
-
             pair_center_x = 0.5 * (common_left + common_right)
             center_factor = max(
                 0.0,
@@ -541,13 +532,20 @@ def select_final_pair(
             # The front-face top/bottom pair has a much larger vertical gap
             # than duplicate edge responses, box-top edges, or printed text.
             pair_score += 5.0 * pixel_gap
+            # Floor appearance breaks ties between otherwise valid pairs. It
+            # is deliberately not a pass/fail condition because wood grain,
+            # reflections, and shadows can make a real floor look textured.
+            if vertical_gradient is not None and floor_visible_below_pair(
+                vertical_gradient,
+                (upper, lower),
+                cfg,
+            ):
+                pair_score += cfg.floor_preference_bonus
             if pair_score > best_score:
                 best_pair = cropped_pair
                 best_score = pair_score
 
-    if best_pair is None:
-        return None, rejected_for_floor
-    return best_pair, rejected_for_floor
+    return best_pair
 
 
 def detect_boundary_result(
@@ -557,15 +555,13 @@ def detect_boundary_result(
     candidates = find_horizontal_candidates(color_bgr, cfg)
     merged = merge_similar_lines(candidates, cfg)
     vertical_gradient = make_vertical_gradient_image(color_bgr)
-    pair, rejected_for_floor = select_final_pair(
+    pair = select_final_pair(
         merged,
         cfg,
         vertical_gradient,
     )
     if pair is not None:
         return DetectionResult(pair, STATUS_DETECTED)
-    if rejected_for_floor:
-        return DetectionResult(None, STATUS_TOO_CLOSE)
     return DetectionResult(None, STATUS_SEARCHING)
 
 
@@ -683,7 +679,7 @@ def draw_final_result(
     display = color_bgr.copy()
     if pair is None:
         text = status
-        text_color = (0, 200, 255) if status == STATUS_TOO_CLOSE else (255, 255, 255)
+        text_color = (255, 255, 255)
     else:
         # Upper: cyan, lower: magenta, as in the RGB verification display.
         line_colors = ((255, 255, 0), (255, 0, 255))
@@ -789,11 +785,7 @@ def run_live() -> None:
 
             color_bgr = np.asanyarray(color_frame.get_data())
             result = detect_boundary_result(color_bgr, cfg)
-            if result.status == STATUS_TOO_CLOSE:
-                tracker.reset()
-                confirmed = None
-            else:
-                confirmed = tracker.update(result.pair)
+            confirmed = tracker.update(result.pair)
 
             display_status = STATUS_DETECTED if confirmed is not None else result.status
             display = draw_final_result(
@@ -820,3 +812,4 @@ def run_live() -> None:
 
 if __name__ == "__main__":
     run_live()
+https://chatgpt.com/c/6a6da8ab-9554-83ee-b8a8-0ee6c21ba1e5
