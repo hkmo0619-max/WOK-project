@@ -61,7 +61,7 @@ class Config:
     min_boundary_gap_px: float = 25.0
     max_boundary_gap_px: float = 140.0
     max_pair_slope_delta: float = 0.12
-    min_space_below_lower_px: int = 16
+    min_space_below_lower_px: int = 10
     min_lower_position_in_roi: float = 0.36
     display_line_length_px: float = 180.0
 
@@ -91,6 +91,7 @@ class Config:
     height_max_column_spread_m: float = 0.012
     height_min_m: float = 0.010
     height_max_m: float = 0.200
+    height_hold_frames: int = 2
 
     # Boundary and height temporal stability
     boundary_window_frames: int = 5
@@ -733,6 +734,32 @@ def sample_surface_xyz(
         y_by_column=y_columns,
     )
 
+def adaptive_height_offsets(
+    front_z_m: float,
+    cfg: Config,
+) -> Tuple[int, ...]:
+    """Z거리에 따라 경계선에서 떨어지는 픽셀 거리를 조절한다.
+
+    약 70cm에서는 기존 6, 7, 8px를 그대로 사용하고,
+    가까워질수록 더 안쪽을 측정한다.
+    """
+    if not np.isfinite(front_z_m):
+        return cfg.height_band_offsets_px
+
+    reference_z_m = 0.70
+
+    scale = float(np.clip(
+        reference_z_m / max(front_z_m, 1e-6),
+        1.0,
+        1.5,
+    ))
+
+    offsets = tuple(sorted(set(
+        max(1, int(round(offset * scale)))
+        for offset in cfg.height_band_offsets_px
+    )))
+
+    return offsets
 
 def measure_height_from_two_boundaries(
     depth_m: np.ndarray,
@@ -808,15 +835,24 @@ def measure_height_from_two_boundaries(
         column_spread_m=float(column_spread),
     )
 
-
 class HeightTracker:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self.history: Deque[float] = deque(maxlen=cfg.height_history_frames)
+
+        self.history: Deque[float] = deque(
+            maxlen=cfg.height_history_frames
+        )
+        self.z_history: Deque[float] = deque(
+            maxlen=cfg.height_history_frames
+        )
+
+        self.last_output: Optional[HeightMeasurement] = None
         self.missed = 0
 
     def reset(self) -> None:
         self.history.clear()
+        self.z_history.clear()
+        self.last_output = None
         self.missed = 0
 
     @property
@@ -824,33 +860,77 @@ class HeightTracker:
         return len(self.history)
 
     def update(
-        self, measurement: Optional[HeightMeasurement]
+        self,
+        measurement: Optional[HeightMeasurement],
     ) -> Optional[HeightMeasurement]:
+
+        # 현재 프레임이 일시적으로 실패한 경우
         if measurement is None:
             self.missed += 1
+
             if self.missed > self.cfg.max_missed_frames:
                 self.reset()
+                return None
+
+            # 1~2프레임 정도의 순간적인 Depth 누락은
+            # 직전 정상 측정값을 유지
+            if (
+                self.last_output is not None
+                and self.missed <= self.cfg.height_hold_frames
+            ):
+                return self.last_output
+
             return None
 
         self.missed = 0
+
+        # 기존 높이와 갑자기 4cm 이상 달라지면
+        # 다른 물체 또는 오검출로 보고 이력 초기화
         if self.history:
             previous = float(np.median(self.history))
-            if abs(measurement.raw_height_m - previous) > self.cfg.height_history_reset_m:
+
+            if (
+                abs(measurement.raw_height_m - previous)
+                > self.cfg.height_history_reset_m
+            ):
                 self.history.clear()
+                self.z_history.clear()
+                self.last_output = None
+
         self.history.append(measurement.raw_height_m)
+        self.z_history.append(measurement.front_z_m)
+
         if len(self.history) < self.cfg.height_required_frames:
             return None
 
-        values = np.asarray(self.history, np.float64)
-        temporal_spread = robust_mad(values)
+        height_values = np.asarray(
+            self.history,
+            dtype=np.float64,
+        )
+        z_values = np.asarray(
+            self.z_history,
+            dtype=np.float64,
+        )
+
+        temporal_spread = robust_mad(height_values)
+
         if temporal_spread > self.cfg.height_max_temporal_spread_m:
             return None
-        return replace(
+
+        output = replace(
             measurement,
-            height_m=float(np.median(values)),
+
+            # 높이 중앙값 안정화
+            height_m=float(np.median(height_values)),
+
+            # Z값도 동일한 프레임 이력의 중앙값으로 안정화
+            front_z_m=float(np.median(z_values)),
+
             temporal_spread_m=float(temporal_spread),
         )
 
+        self.last_output = output
+        return output
 
 def center_crop_line(line: Line, max_length: float) -> Line:
     if line.length_x <= max_length:
@@ -1001,22 +1081,33 @@ def run_live() -> None:
                     intrinsics, [float(pixel[0]), float(pixel[1])], float(depth)
                 )
 
-            detected, _ = detect_boundary_pair(color, depth_m, cfg)
-            confirmed = boundary_tracker.update(detected)
-            evidence = (
-                assess_pair_depth(depth_m, confirmed, cfg)
-                if confirmed is not None else None
+            detected, detected_evidence = detect_boundary_pair(
+                color, depth_m, cfg
             )
+
+            confirmed = boundary_tracker.update(detected)
+
             raw_measurement = None
+
             if (
-                confirmed is not None
+                detected is not None
+                and confirmed is not None
                 and boundary_tracker.current_matches(detected)
-                and evidence is not None
-                and evidence.tier >= cfg.min_evidence_tier
+                and detected_evidence is not None
+                and detected_evidence.tier >= cfg.min_evidence_tier
             ):
-                raw_measurement = measure_height_from_two_boundaries(
-                    depth_m, confirmed, deproject, cfg, evidence
+                measure_pair_array = (
+                0.8 * pair_array(confirmed)
+                + 0.2 * pair_array(detected)
                 )
+                measure_pair = pair_from_array(measure_pair_array)
+                raw_measurement = measure_height_from_two_boundaries(
+            depth_m,
+            measure_pair,
+            deproject,
+            cfg,
+            detected_evidence,  # 검출 당시 통과한 evidence 사용
+            )
             stable_measurement = height_tracker.update(raw_measurement)
 
             display = draw_result(
