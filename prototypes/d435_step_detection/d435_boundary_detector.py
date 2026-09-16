@@ -37,8 +37,8 @@ class DetectorConfig:
 
     # Temporary lower-central bench-test ROI. Recalibrate these four ratios
     # after the D435 is rigidly mounted on the robot.
-    roi_left: float = 0.20
-    roi_top: float = 0.35
+    roi_left: float = 0.25
+    roi_top: float = 0.30
     roi_right: float = 0.80
     roi_bottom: float = 1.00
 
