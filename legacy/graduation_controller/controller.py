@@ -1,80 +1,41 @@
 from flask import Flask, render_template_string, jsonify
-import serial
-import time
-import threading
-import atexit
-import math
-import os
-import glob
-import logging
+import serial, time, threading, atexit, math, os, glob, logging
 
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
-try:
-    import ydlidar
-    YDLIDAR_AVAILABLE = True
-except ImportError:
-    ydlidar = None
-    YDLIDAR_AVAILABLE = False
+try:    import ydlidar; YDLIDAR_OK = True
+except: ydlidar = None; YDLIDAR_OK = False
 
-SERIAL_PORT = "/dev/stm32"
-BAUDRATE    = 115200
-LIDAR_PORT  = "auto"
+# ── 설정 ──────────────────────────────────────────────────────────────────────
+SERIAL_PORT, BAUDRATE = "/dev/stm32", 115200
+LIDAR_PORT, LIDAR_BAUDRATE, LIDAR_SAMPLE_RATE = "auto", 230400, 5
+LIDAR_SCAN_FREQ, LIDAR_MIN_RANGE, LIDAR_MAX_RANGE = 10.0, 0.28, 16.0
+WEB_HOST, WEB_PORT = "0.0.0.0", 5000
+HOLD_REPEAT_MS, STATUS_UPDATE_MS, MODE_SWITCH_TIME = 100, 200, 5.0
+OBSTACLE_DIST, TOO_CLOSE_DIST = 0.50, 0.12
+AVOID_FWD_TIME, AVOID_LOOP_DELAY, AVOID_REPEAT_TIME = 0.08, 0.03, 0.10
+FRONT_CENTER_DEG, FRONT_WIDTH_DEG = 180.0, 30.0
 
-LIDAR_BAUDRATE    = 230400
-LIDAR_SAMPLE_RATE = 5
-LIDAR_SCAN_FREQ   = 10.0
-LIDAR_MIN_RANGE   = 0.28
-LIDAR_MAX_RANGE   = 16.0
-
-WEB_HOST = "0.0.0.0"
-WEB_PORT = 5000
-
-HOLD_REPEAT_MS   = 100
-STATUS_UPDATE_MS = 200
-MODE_SWITCH_TIME = 1.0
-
-OBSTACLE_DISTANCE_M  = 0.50
-TOO_CLOSE_DISTANCE_M = 0.12
-AVOID_FORWARD_TIME   = 0.08
-AVOID_LOOP_DELAY     = 0.03
-AVOID_CMD_REPEAT_TIME = 0.10
-
-FRONT_CENTER_DEG = 180.0
-FRONT_WIDTH_DEG  = 30.0
-
-STM32_CMD_MAP = {
-    "ping": "PING", "stop": "STOP",
-    "wheel": "WHEEL", "leg": "LEG",
-    "forward": "FWD", "backward": "BACK",
-    "tank_left": "TL", "tank_right": "TR",
+CMD_MAP = {
+    "ping":"PING", "stop":"STOP", "wheel":"WHEEL", "leg":"LEG",
+    "forward":"FWD", "backward":"BACK", "tank_left":"TL", "tank_right":"TR",
 }
-DRIVE_COMMANDS = {"forward", "backward", "tank_left", "tank_right", "stop"}
+DRIVE_CMDS = {"forward", "backward", "tank_left", "tank_right", "stop"}
 
-app = Flask(__name__)
-
-ser         = None
-serial_lock = threading.Lock()
-laser       = None
-lidar_lock  = threading.Lock()
-
-avoid_thread     = None
-avoid_stop_event = threading.Event()
-
+# ── 전역 상태 ─────────────────────────────────────────────────────────────────
+app  = Flask(__name__)
+ser  = None;  serial_lock = threading.Lock()
+laser = None; lidar_lock  = threading.Lock()
+avoid_thread = None; avoid_stop = threading.Event()
 state_lock = threading.Lock()
-state = {
-    "mode": "wheel", "motion": "stop",
-    "mode_switching": False, "auto_avoid": False,
-    "front_distance": None, "message": "Ready",
-}
+state = {"mode":"wheel","motion":"stop","mode_switching":False,
+         "auto_avoid":False,"front_distance":None,"message":"Ready"}
 
-def log_info(msg): print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
-def log_tx(cmd):   print(f"[{time.strftime('%H:%M:%S')}] TX → {cmd}", flush=True)
-
+def ts():           return time.strftime('%H:%M:%S')
+def log(msg):       print(f"[{ts()}] {msg}", flush=True)
 def set_state(**kw):
     with state_lock: state.update(kw)
-
-def get_state_copy():
+def get_state():
     with state_lock: return dict(state)
 
 # ── Serial ────────────────────────────────────────────────────────────────────
@@ -82,96 +43,84 @@ def init_serial():
     global ser
     try:
         ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=1)
-        time.sleep(2.0)
-        log_info(f"[OK] Serial: {SERIAL_PORT}")
-        set_state(message=f"Serial opened: {SERIAL_PORT}")
-        return True
+        time.sleep(2.0); log(f"Serial OK: {SERIAL_PORT}")
+        set_state(message=f"Serial opened: {SERIAL_PORT}"); return True
     except Exception as e:
-        log_info(f"[ERR] Serial: {e}"); set_state(message="Serial open failed"); ser = None; return False
+        log(f"Serial ERR: {e}"); set_state(message="Serial open failed"); ser = None; return False
 
-def send_to_stm32(cmd, wait_reply=False):
-    global ser
+def send(cmd, reply=False):
     cmd = cmd.lower()
-    if cmd not in STM32_CMD_MAP: log_info(f"[ERR] Unknown: {cmd}"); return None
-    if ser is None or not ser.is_open: log_info("[ERR] Serial not open"); return None
-    stm32_cmd = STM32_CMD_MAP[cmd]
+    if cmd not in CMD_MAP or ser is None or not ser.is_open: return None
+    raw = CMD_MAP[cmd]
     try:
         with serial_lock:
-            if wait_reply: ser.reset_input_buffer()
-            ser.write((stm32_cmd + "\r\n").encode("ascii")); ser.flush(); log_tx(stm32_cmd)
-            if wait_reply:
-                resp = ser.readline().decode("ascii", errors="ignore").strip()
-                log_info(f"RX ← {resp}"); return resp
-    except Exception as e:
-        log_info(f"[ERR] Send: {e}")
+            if reply: ser.reset_input_buffer()
+            ser.write((raw + "\r\n").encode()); ser.flush(); log(f"TX→ {raw}")
+            if reply:
+                r = ser.readline().decode("ascii", errors="ignore").strip()
+                log(f"RX← {r}"); return r
+    except Exception as e: log(f"Send ERR: {e}")
     return None
 
-def ping_stm32():
-    resp = send_to_stm32("ping", wait_reply=True)
-    if resp == "OK":
-        log_info("[OK] STM32 connected"); set_state(message="STM32 connected: OK"); return True
-    log_info("[WARN] STM32 PING failed"); set_state(message="STM32 PING failed"); return False
+def ping():
+    ok = send("ping", reply=True) == "OK"
+    set_state(message="STM32 OK" if ok else "STM32 PING failed"); return ok
 
 # ── LiDAR ─────────────────────────────────────────────────────────────────────
 def find_lidar_ports():
     if LIDAR_PORT != "auto":
         return [LIDAR_PORT] if os.path.exists(LIDAR_PORT) else []
-    ports = []
-    if os.path.exists("/dev/ydlidar"): ports.append("/dev/ydlidar")
-    for p in sorted(glob.glob("/dev/ttyUSB*")):
-        if p not in ports: ports.append(p)
-    return ports
-
-def set_lidar_opt(obj, name, value):
-    if hasattr(ydlidar, name):
-        try: obj.setlidaropt(getattr(ydlidar, name), value); return True
-        except Exception as e: log_info(f"[WARN] set {name}: {e}")
-    return False
+    ports = ["/dev/ydlidar"] if os.path.exists("/dev/ydlidar") else []
+    return ports + [p for p in sorted(glob.glob("/dev/ttyUSB*")) if p not in ports]
 
 def init_lidar():
     global laser
-    if not YDLIDAR_AVAILABLE: set_state(message="LiDAR not available"); return False
+    if not YDLIDAR_OK: set_state(message="LiDAR N/A"); return False
     ports = find_lidar_ports()
-    if not ports: log_info("[ERR] No LiDAR port"); set_state(message="No LiDAR port"); return False
+    if not ports: set_state(message="No LiDAR port"); return False
     try: ydlidar.os_init()
-    except Exception: pass
-
+    except: pass
     for port in ports:
         try:
-            ldr = ydlidar.CYdLidar()
-            ldr.setlidaropt(ydlidar.LidarPropSerialPort,     port)
-            ldr.setlidaropt(ydlidar.LidarPropSerialBaudrate, LIDAR_BAUDRATE)
-            ldr.setlidaropt(ydlidar.LidarPropLidarType,      ydlidar.TYPE_TRIANGLE)
-            ldr.setlidaropt(ydlidar.LidarPropDeviceType,     ydlidar.YDLIDAR_TYPE_SERIAL)
-            ldr.setlidaropt(ydlidar.LidarPropScanFrequency,  LIDAR_SCAN_FREQ)
-            ldr.setlidaropt(ydlidar.LidarPropSampleRate,     LIDAR_SAMPLE_RATE)
-            ldr.setlidaropt(ydlidar.LidarPropSingleChannel,  False)
-            ldr.setlidaropt(ydlidar.LidarPropMaxAngle,       180.0)
-            ldr.setlidaropt(ydlidar.LidarPropMinAngle,      -180.0)
-            ldr.setlidaropt(ydlidar.LidarPropMaxRange,       LIDAR_MAX_RANGE)
-            ldr.setlidaropt(ydlidar.LidarPropMinRange,       LIDAR_MIN_RANGE)
-            if not set_lidar_opt(ldr, "LidarPropIntenstiy", True):
-                set_lidar_opt(ldr, "LidarPropIntensity", True)
-            set_lidar_opt(ldr, "LidarPropSupportMotorDtrCtrl", False)
-
-            if not ldr.initialize(): ldr.disconnecting(); continue
-            if not ldr.turnOn(): ldr.turnOff(); ldr.disconnecting(); continue
-
-            laser = ldr; log_info(f"[OK] LiDAR: {port}"); set_state(message=f"LiDAR: {port}"); return True
+            L = ydlidar.CYdLidar()
+            for name, val in [
+                ("LidarPropSerialPort",        port),
+                ("LidarPropSerialBaudrate",    LIDAR_BAUDRATE),
+                ("LidarPropLidarType",         ydlidar.TYPE_TRIANGLE),
+                ("LidarPropDeviceType",        ydlidar.YDLIDAR_TYPE_SERIAL),
+                ("LidarPropScanFrequency",     LIDAR_SCAN_FREQ),
+                ("LidarPropSampleRate",        LIDAR_SAMPLE_RATE),
+                ("LidarPropSingleChannel",     False),
+                ("LidarPropMaxAngle",          180.0),
+                ("LidarPropMinAngle",         -180.0),
+                ("LidarPropMaxRange",          LIDAR_MAX_RANGE),
+                ("LidarPropMinRange",          LIDAR_MIN_RANGE),
+                ("LidarPropIntenstiy",         True),
+                ("LidarPropSupportMotorDtrCtrl", False),
+            ]:
+                if hasattr(ydlidar, name):
+                    try: L.setlidaropt(getattr(ydlidar, name), val)
+                    except: pass
+            # 오타 폴백: Intenstiy 실패 시 Intensity 시도
+            if not hasattr(ydlidar, "LidarPropIntenstiy") and hasattr(ydlidar, "LidarPropIntensity"):
+                try: L.setlidaropt(ydlidar.LidarPropIntensity, True)
+                except: pass
+            if not L.initialize(): L.disconnecting(); continue
+            if not L.turnOn():    L.turnOff(); L.disconnecting(); continue
+            laser = L; log(f"LiDAR OK: {port}"); set_state(message=f"LiDAR: {port}"); return True
         except Exception as e:
-            log_info(f"[WARN] LiDAR {port}: {e}")
-            try: ldr.disconnecting()
-            except Exception: pass
-
-    log_info("[ERR] LiDAR start failed"); set_state(message="LiDAR start failed"); return False
+            log(f"LiDAR {port}: {e}")
+            try: L.disconnecting()
+            except: pass
+    set_state(message="LiDAR start failed"); return False
 
 def close_lidar():
     global laser
     try:
         if laser: laser.turnOff(); laser.disconnecting(); laser = None
-    except Exception as e: log_info(f"[WARN] LiDAR close: {e}")
+    except Exception as e: log(f"LiDAR close: {e}")
 
-def get_front_distance():
+def front_dist():
     if laser is None: return None
     try:
         scan = ydlidar.LaserScan()
@@ -179,313 +128,239 @@ def get_front_distance():
             if not laser.doProcessSimple(scan): return None
         dists = []
         for p in scan.points:
-            deg = math.degrees(p.angle)
-            if deg < 0: deg += 360.0
+            deg = math.degrees(p.angle) % 360
             d = p.range
-            if d <= TOO_CLOSE_DISTANCE_M or d <= 0.0: continue
-            if not (LIDAR_MIN_RANGE <= d <= LIDAR_MAX_RANGE): continue
-            if abs((deg - FRONT_CENTER_DEG + 180.0) % 360.0 - 180.0) <= FRONT_WIDTH_DEG / 2.0:
+            if d <= TOO_CLOSE_DIST or not (LIDAR_MIN_RANGE <= d <= LIDAR_MAX_RANGE): continue
+            if abs((deg - FRONT_CENTER_DEG + 180) % 360 - 180) <= FRONT_WIDTH_DEG / 2:
                 dists.append(d)
         return min(dists) if dists else None
-    except Exception as e:
-        log_info(f"[WARN] LiDAR scan: {e}"); return None
+    except Exception as e: log(f"LiDAR scan: {e}"); return None
 
 # ── 모드 전환 ─────────────────────────────────────────────────────────────────
-def finish_mode_switch(target):
+def _finish_switch(target):
     time.sleep(MODE_SWITCH_TIME)
     set_state(mode=target, mode_switching=False, motion="stop", message=f"Mode: {target}")
-    log_info(f"[MODE] → {target}")
+    log(f"Mode → {target}")
 
 def start_mode_switch(target):
     target = target.lower()
-    if target not in ("wheel", "leg"): return False, "Unknown mode"
-    cur = get_state_copy()
-    if cur["mode_switching"]: return False, "Mode switching in progress"
-    if target == cur["mode"]: return True, f"Already {target}"
-    set_state(mode_switching=True, auto_avoid=False, motion="stop", message=f"Switching to {target}")
-    stop_obstacle_avoidance(send_stop=False, update_message=False)
-    send_to_stm32("stop"); time.sleep(0.1); send_to_stm32(target)
-    threading.Thread(target=finish_mode_switch, args=(target,), daemon=True).start()
+
+    if target not in ("wheel", "leg"):
+        return False, "Unknown mode"
+
+    cur = get_state()
+
+    if cur["mode_switching"]:
+        return False, "Mode switching in progress"
+
+    set_state(
+        mode_switching=True,
+        auto_avoid=False,
+        motion="stop",
+        message=f"Switching to {target}"
+    )
+
+    stop_avoidance(send_stop=False, update=False)
+
+    # WHEEL / LEG 명령을 무조건 STM32로 전송
+    send(target)
+
+    threading.Thread(target=_finish_switch, args=(target,), daemon=True).start()
     return True, f"Switching to {target}"
-
 # ── 장애물 회피 ───────────────────────────────────────────────────────────────
-def _turn_and_check():
-    """TR 후 전방 재확인. 최대 3회 추가 회전. 확보되면 True 반환."""
-    send_to_stm32("stop"); set_state(motion="stop"); time.sleep(0.10)
-    for _ in range(3):
-        if avoid_stop_event.is_set(): return False
-        chk = get_front_distance(); set_state(front_distance=chk)
-        if chk is None or chk > OBSTACLE_DISTANCE_M: return True
-        log_info(f"[AUTO] 여전히 막힘: {chk:.2f} m")
-        send_to_stm32("tank_right"); set_state(motion="tank_right"); time.sleep(AVOID_TURN_TIME)
-        send_to_stm32("stop"); set_state(motion="stop"); time.sleep(0.10)
-    return not avoid_stop_event.is_set()
-
-def obstacle_avoidance_loop():
-    log_info("[AUTO] 회피 시작")
+def _avoidance_loop():
+    log("Auto avoid started")
     set_state(auto_avoid=True, motion="stop", message="Obstacle avoidance started")
+    last_cmd, last_tx = None, 0.0
 
-    last_cmd = None
-    last_tx_time = 0.0
-
-    def send_auto_cmd(cmd, message):
-        """
-        같은 명령을 너무 과하게 보내지 않도록 일정 주기로만 재전송.
-        단, 명령이 바뀌면 즉시 전송.
-        """
-        nonlocal last_cmd, last_tx_time
-
+    def auto_send(cmd, msg):
+        nonlocal last_cmd, last_tx
         now = time.time()
+        if cmd != last_cmd or (now - last_tx) >= AVOID_REPEAT_TIME:
+            send(cmd); last_cmd = cmd; last_tx = now
+        set_state(motion=cmd, message=msg)
 
-        if cmd != last_cmd or (now - last_tx_time) >= AVOID_CMD_REPEAT_TIME:
-            send_to_stm32(cmd)
-            last_cmd = cmd
-            last_tx_time = now
+    while not avoid_stop.is_set():
+        cur = get_state()
+        if cur["mode"] != "wheel" or cur["mode_switching"]:
+            send("stop"); set_state(motion="stop", message="Auto avoid: stopped"); break
 
-        set_state(motion=cmd, message=message)
+        d = front_dist(); set_state(front_distance=d)
+        if d is None:
+            auto_send("stop", "No LiDAR data"); time.sleep(AVOID_LOOP_DELAY); continue
 
-    while not avoid_stop_event.is_set():
-        cur = get_state_copy()
-
-        if cur["mode"] != "wheel":
-            send_to_stm32("stop")
-            set_state(motion="stop", message="Auto avoid: not wheel mode")
-            break
-
-        if cur["mode_switching"]:
-            send_to_stm32("stop")
-            set_state(motion="stop", message="Auto avoid: mode switching")
-            break
-
-        dist = get_front_distance()
-        set_state(front_distance=dist)
-
-        if dist is None:
-            send_auto_cmd("stop", "No LiDAR data")
-            time.sleep(AVOID_LOOP_DELAY)
-            continue
-
-        if dist <= OBSTACLE_DISTANCE_M:
-            # 장애물이 0.5m 이내면 STOP을 반복하지 않고 TR을 계속 유지
-            log_info(f"[AUTO] 장애물 감지: {dist:.2f} m -> TR 유지")
-            send_auto_cmd("tank_right", f"Avoiding TR: {dist:.2f} m")
-
+        if d <= OBSTACLE_DIST:
+            log(f"Obstacle: {d:.2f} m → TR")
+            auto_send("tank_right", f"Avoiding TR: {d:.2f} m")
         else:
-            # 전방이 0.5m 이상 확보되면 바로 FWD로 전환
-            send_auto_cmd("forward", f"Forward: {dist:.2f} m")
-
+            auto_send("forward", f"Forward: {d:.2f} m")
         time.sleep(AVOID_LOOP_DELAY)
 
-    send_to_stm32("stop")
-    set_state(auto_avoid=False, motion="stop", message="Obstacle avoidance stopped")
-    log_info("[AUTO] 회피 종료")
+    send("stop"); set_state(auto_avoid=False, motion="stop", message="Obstacle avoidance stopped")
+    log("Auto avoid stopped")
 
-def start_obstacle_avoidance():
+def start_avoidance():
     global avoid_thread
-    if laser is None: return False, "LiDAR not ready"
-    cur = get_state_copy()
-    if cur["mode_switching"]: return False, "Mode switching in progress"
+    if laser is None:          return False, "LiDAR not ready"
+    cur = get_state()
+    if cur["mode_switching"]:  return False, "Mode switching in progress"
     if cur["mode"] != "wheel": return False, "Wheel mode only"
-    if cur["auto_avoid"]: return True, "Already running"
-    avoid_stop_event.clear()
-    avoid_thread = threading.Thread(target=obstacle_avoidance_loop, daemon=True)
+    if cur["auto_avoid"]:      return True,  "Already running"
+    avoid_stop.clear()
+    avoid_thread = threading.Thread(target=_avoidance_loop, daemon=True)
     avoid_thread.start()
     return True, "Obstacle avoidance started"
 
-def stop_obstacle_avoidance(send_stop=True, update_message=True):
+def stop_avoidance(send_stop=True, update=True):
     global avoid_thread
-    avoid_stop_event.set(); avoid_thread = None
-    if send_stop: send_to_stm32("stop")
-    if update_message: set_state(auto_avoid=False, motion="stop", message="Obstacle avoidance stopped")
-    else: set_state(auto_avoid=False, motion="stop")
+    avoid_stop.set(); avoid_thread = None
+    if send_stop: send("stop")
+    if update: set_state(auto_avoid=False, motion="stop", message="Obstacle avoidance stopped")
+    else:       set_state(auto_avoid=False, motion="stop")
 
 # ── Web UI ────────────────────────────────────────────────────────────────────
-html = """
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Robot Controller</title>
-    <style>
-        body { font-family: Arial, sans-serif; text-align: center; margin-top: 35px;
-               user-select: none; touch-action: none; background: #f4f4f4; }
-        h1 { margin-bottom: 20px; }
-        .status { display: inline-block; min-width: 360px; padding: 15px; margin-bottom: 20px;
-                  background: white; border-radius: 12px; border: 1px solid #ccc;
-                  font-size: 18px; line-height: 1.7; }
-        button { width: 150px; height: 75px; font-size: 22px; margin: 8px;
-                 border-radius: 14px; border: 1px solid #555; touch-action: none; cursor: pointer; }
-        button:active { background-color: #cccccc; }
-        button:disabled { opacity: 0.45; cursor: not-allowed; }
-        .move { background-color: #eeeeee; }
-        .stop { background-color: red; color: white; font-weight: bold; }
-        .mode { background-color: #ddeeff; }
-        .auto-on  { background-color: #ddffdd; }
-        .auto-off { background-color: #ffe0cc; }
-        .small { font-size: 15px; color: #555; margin-top: 15px; }
-    </style>
-</head>
-<body>
-    <h1>Robot Web Controller</h1>
-    <div class="status">
-        <div>Mode: <b id="mode">-</b></div>
-        <div>Motion: <b id="motion">-</b></div>
-        <div>Mode Switching: <b id="mode_switching">-</b></div>
-        <div>Auto Avoid: <b id="auto_avoid">-</b></div>
-        <div>Front Distance: <b id="front_distance">-</b></div>
-        <div>Message: <b id="message">-</b></div>
-    </div>
-    <div>
-        <button class="mode" onclick="setMode('wheel')">WHEEL</button>
-        <button class="mode" onclick="setMode('leg')">LEG</button>
-    </div>
-    <div><button class="move drive-btn" id="forward">Forward</button></div>
-    <div>
-        <button class="move drive-btn" id="tank_left">Tank Left</button>
-        <button class="stop" onclick="stopAll()">Stop</button>
-        <button class="move drive-btn" id="tank_right">Tank Right</button>
-    </div>
-    <div><button class="move drive-btn" id="backward">Backward</button></div>
-    <div style="margin-top:20px;">
-        <button class="auto-on" id="avoid_on" onclick="startAvoid()">Avoid ON</button>
-        <button class="auto-off" onclick="stopAvoid()">Avoid OFF</button>
-    </div>
-    <p class="small">
-        전진 / 후진 / 회전은 wheel mode에서만 작동합니다.<br>
-        버튼을 누르고 있으면 명령이 반복 전송되고, 떼면 정지됩니다.<br>
-        장애물 회피는 wheel mode에서만 작동합니다.
-    </p>
-<script>
-"use strict";
-let activeCmd = null, repeatTimer = null, stoppingInProgress = false;
-const REPEAT_MS = __HOLD_REPEAT_MS__, STATUS_MS = __STATUS_UPDATE_MS__;
+HTML = """<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8"><title>Robot Controller</title>
+<style>
+body{font-family:Arial,sans-serif;text-align:center;margin-top:35px;user-select:none;touch-action:none;background:#f4f4f4}
+h1{margin-bottom:20px}
+.status{display:inline-block;min-width:360px;padding:15px;margin-bottom:20px;background:white;border-radius:12px;border:1px solid #ccc;font-size:18px;line-height:1.7}
+button{width:150px;height:75px;font-size:22px;margin:8px;border-radius:14px;border:1px solid #555;touch-action:none;cursor:pointer}
+button:active{background:#ccc} button:disabled{opacity:.45;cursor:not-allowed}
+.move{background:#eee} .stop{background:red;color:white;font-weight:bold}
+.mode{background:#ddeeff} .auto-on{background:#ddffdd} .auto-off{background:#ffe0cc}
+.small{font-size:15px;color:#555;margin-top:15px}
+</style></head><body>
+<h1>Robot Web Controller</h1>
+<div class="status">
+  <div>Mode: <b id="mode">-</b></div><div>Motion: <b id="motion">-</b></div>
+  <div>Mode Switching: <b id="mode_switching">-</b></div><div>Auto Avoid: <b id="auto_avoid">-</b></div>
+  <div>Front Distance: <b id="front_distance">-</b></div><div>Message: <b id="message">-</b></div>
+</div>
+<div>
+  <button class="mode" onclick="setMode('wheel')">WHEEL</button>
+  <button class="mode" onclick="setMode('leg')">LEG</button>
+</div>
+<div><button class="move drive-btn" id="forward">Forward</button></div>
+<div>
+  <button class="move drive-btn" id="tank_left">Tank Left</button>
+  <button class="stop" onclick="stopAll()">Stop</button>
+  <button class="move drive-btn" id="tank_right">Tank Right</button>
+</div>
+<div><button class="move drive-btn" id="backward">Backward</button></div>
+<div style="margin-top:20px">
+  <button class="auto-on" id="avoid_on" onclick="startAvoid()">Avoid ON</button>
+  <button class="auto-off" onclick="stopAvoid()">Avoid OFF</button>
+</div>
+<p class="small">
+  전진/후진/회전은 wheel mode에서만 동작합니다.<br>
+  버튼을 누르고 있으면 명령이 반복 전송되고, 떼면 정지합니다.<br>
+  장애물 회피는 wheel mode에서만 동작합니다.
+</p>
+<script>"use strict";
+let activeCmd=null,repeatTimer=null,stopping=false;
+const REPEAT_MS=__RPT__,STATUS_MS=__STA__;
 
-const post = url => fetch(url, { method: "POST" }).then(r => r.json()).then(d => { updateStatus(); return d; });
-const sendCmd = (cmd, refresh) => fetch("/cmd/" + cmd, { method: "POST" })
-    .then(r => r.json()).then(d => { if (refresh !== false) updateStatus(); return d; });
+const post=url=>fetch(url,{method:"POST"}).then(r=>r.json()).then(d=>{upd();return d;});
+const sendCmd=(cmd,ref)=>fetch("/cmd/"+cmd,{method:"POST"}).then(r=>r.json()).then(d=>{if(ref!==false)upd();return d;});
+const setMode=m=>{stopRpt();sendStop();post("/mode/"+m);};
+const startAvoid=()=>{stopRpt();post("/avoid/start");};
+const stopAvoid=()=>{stopRpt();post("/avoid/stop");};
+const stopAll=()=>{stopRpt();sendStop();};
 
-const setMode    = m => { stopRepeat(); sendStop(); post("/mode/" + m); };
-const startAvoid = () => { stopRepeat(); post("/avoid/start"); };
-const stopAvoid  = () => { stopRepeat(); post("/avoid/stop"); };
-const stopAll    = () => { stopRepeat(); sendStop(); };
-
-function stopRepeat() {
-    if (repeatTimer) { clearInterval(repeatTimer); repeatTimer = null; }
-    activeCmd = null;
+function stopRpt(){if(repeatTimer){clearInterval(repeatTimer);repeatTimer=null;}activeCmd=null;}
+function sendStop(){
+  if(stopping)return; stopping=true;
+  fetch("/cmd/stop",{method:"POST",keepalive:true}).then(r=>r.json()).then(()=>upd())
+  .catch(e=>console.error("stop:",e)).finally(()=>{stopping=false;});
 }
-
-function sendStop() {
-    if (stoppingInProgress) return;
-    stoppingInProgress = true;
-    fetch("/cmd/stop", { method: "POST", keepalive: true })
-        .then(r => r.json()).then(() => updateStatus())
-        .catch(e => console.error("stop:", e))
-        .finally(() => { stoppingInProgress = false; });
+function startCmd(cmd,e){
+  e.preventDefault();e.stopPropagation();
+  try{e.currentTarget.setPointerCapture(e.pointerId);}catch(_){}
+  const btn=document.getElementById(cmd);
+  if(btn&&btn.disabled)return;
+  stopRpt();activeCmd=cmd;stopping=false;
+  sendCmd(cmd,true);
+  repeatTimer=setInterval(()=>{if(activeCmd)sendCmd(activeCmd,false);},REPEAT_MS);
 }
-
-function startCommand(cmd, e) {
-    e.preventDefault(); e.stopPropagation();
-    try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
-    const btn = document.getElementById(cmd);
-    if (btn && btn.disabled) return;
-    stopRepeat(); activeCmd = cmd; stoppingInProgress = false;
-    sendCmd(cmd, true);
-    repeatTimer = setInterval(() => { if (activeCmd) sendCmd(activeCmd, false); }, REPEAT_MS);
+function stopCmd(e){
+  e.preventDefault();e.stopPropagation();
+  if(!activeCmd)return; stopRpt();sendStop();
 }
+["forward","backward","tank_left","tank_right"].forEach(id=>{
+  const b=document.getElementById(id);
+  b.addEventListener("pointerdown",e=>startCmd(id,e));
+  b.addEventListener("pointerup",stopCmd);
+  b.addEventListener("pointercancel",stopCmd);
+  b.addEventListener("lostpointercapture",stopCmd);
+  b.addEventListener("pointerleave",e=>{if(activeCmd===id)stopCmd(e);});
+  b.addEventListener("contextmenu",e=>e.preventDefault());
+});
+window.addEventListener("blur",()=>{if(activeCmd){stopRpt();sendStop();}});
+document.addEventListener("visibilitychange",()=>{if(document.hidden&&activeCmd){stopRpt();sendStop();}});
+document.addEventListener("contextmenu",e=>e.preventDefault());
 
-function stopCommand(e) {
-    e.preventDefault(); e.stopPropagation();
-    if (!activeCmd) return;
-    stopRepeat(); sendStop();
+function upd(){
+  fetch("/status").then(r=>r.json()).then(d=>{
+    ["mode","motion","mode_switching","auto_avoid","message"].forEach(k=>document.getElementById(k).innerText=d[k]);
+    document.getElementById("front_distance").innerText=d.front_distance===null?"None":Number(d.front_distance).toFixed(2)+" m";
+    const blocked=d.mode_switching||d.mode!=="wheel"||d.auto_avoid;
+    document.querySelectorAll(".drive-btn").forEach(b=>b.disabled=blocked);
+    document.getElementById("avoid_on").disabled=d.mode_switching||d.mode!=="wheel";
+  }).catch(e=>console.error("status:",e));
 }
+setInterval(upd,STATUS_MS);upd();
+</script></body></html>""".replace("__RPT__", str(HOLD_REPEAT_MS)).replace("__STA__", str(STATUS_UPDATE_MS))
 
-function setupHoldButton(id, cmd) {
-    const btn = document.getElementById(id);
-    btn.addEventListener("pointerdown",        e => startCommand(cmd, e));
-    btn.addEventListener("pointerup",          stopCommand);
-    btn.addEventListener("pointercancel",      stopCommand);
-    btn.addEventListener("lostpointercapture", stopCommand);
-    btn.addEventListener("pointerleave",       e => { if (activeCmd === cmd) stopCommand(e); });
-    btn.addEventListener("contextmenu",        e => e.preventDefault());
-}
-
-setupHoldButton("forward",    "forward");
-setupHoldButton("backward",   "backward");
-setupHoldButton("tank_left",  "tank_left");
-setupHoldButton("tank_right", "tank_right");
-
-window.addEventListener("blur", () => { if (activeCmd) { stopRepeat(); sendStop(); } });
-document.addEventListener("visibilitychange", () => { if (document.hidden && activeCmd) { stopRepeat(); sendStop(); } });
-document.addEventListener("contextmenu", e => e.preventDefault());
-
-function updateStatus() {
-    fetch("/status").then(r => r.json()).then(d => {
-        ["mode","motion","mode_switching","auto_avoid","message"].forEach(k =>
-            document.getElementById(k).innerText = d[k]);
-        document.getElementById("front_distance").innerText =
-            d.front_distance === null ? "None" : Number(d.front_distance).toFixed(2) + " m";
-        const blocked = d.mode_switching || d.mode !== "wheel" || d.auto_avoid;
-        document.querySelectorAll(".drive-btn").forEach(b => b.disabled = blocked);
-        document.getElementById("avoid_on").disabled = d.mode_switching || d.mode !== "wheel";
-    }).catch(e => console.error("status:", e));
-}
-setInterval(updateStatus, STATUS_MS);
-updateStatus();
-</script>
-</body>
-</html>
-""".replace("__HOLD_REPEAT_MS__", str(HOLD_REPEAT_MS)).replace("__STATUS_UPDATE_MS__", str(STATUS_UPDATE_MS))
-
-# ── Flask Routes ──────────────────────────────────────────────────────────────
-def ok_json(**kw):     return jsonify({"ok": True,  **kw})
-def err_json(m, **kw): return jsonify({"ok": False, "message": m, **kw})
+# ── Flask 라우트 ──────────────────────────────────────────────────────────────
+ok_r  = lambda **kw: jsonify({"ok": True,  **kw})
+err_r = lambda m, **kw: jsonify({"ok": False, "message": m, **kw})
 
 @app.route("/")
-def index(): return render_template_string(html)
+def index(): return render_template_string(HTML)
 
 @app.route("/status")
-def status(): return jsonify(get_state_copy())
+def status(): return jsonify(get_state())
 
 @app.route("/cmd/<cmd>", methods=["POST"])
 def command(cmd):
     cmd = cmd.lower()
-    if cmd not in DRIVE_COMMANDS: return err_json("Unknown command")
-    cur = get_state_copy()
+    if cmd not in DRIVE_CMDS: return err_r("Unknown command")
+    cur = get_state()
     if cur["mode_switching"] and cmd != "stop":
-        set_state(message="Command ignored: mode switching"); return err_json("Command ignored: mode switching")
-    if cur["auto_avoid"]: stop_obstacle_avoidance(send_stop=False, update_message=True)
-    cur = get_state_copy()
-    if cmd != "stop" and cur["mode"] != "wheel":
-        set_state(motion="stop", message="Drive ignored: not wheel mode"); send_to_stm32("stop")
-        return err_json("Drive command ignored: not wheel mode")
-    send_to_stm32(cmd); set_state(motion=cmd, message=f"Manual: {cmd}")
-    return ok_json(message=f"Manual: {cmd}")
+        set_state(message="Command ignored: mode switching")
+        return err_r("Command ignored: mode switching")
+    if cur["auto_avoid"]: stop_avoidance(send_stop=False, update=True)
+    if cmd != "stop" and get_state()["mode"] != "wheel":
+        set_state(motion="stop", message="Drive ignored: not wheel mode"); send("stop")
+        return err_r("Drive command ignored: not wheel mode")
+    send(cmd); set_state(motion=cmd, message=f"Manual: {cmd}")
+    return ok_r(message=f"Manual: {cmd}")
 
 @app.route("/mode/<mode>", methods=["POST"])
 def mode_route(mode):
-    mode = mode.lower()
-    if mode not in ("wheel", "leg"): return err_json("Unknown mode")
-    ok, msg = start_mode_switch(mode); cur = get_state_copy()
-    return jsonify({"ok": ok, "mode": cur["mode"], "mode_switching": cur["mode_switching"], "message": msg})
+    ok, msg = start_mode_switch(mode.lower()); cur = get_state()
+    return jsonify({"ok":ok,"mode":cur["mode"],"mode_switching":cur["mode_switching"],"message":msg})
 
 @app.route("/avoid/start", methods=["POST"])
 def avoid_start():
-    ok, msg = start_obstacle_avoidance(); return jsonify({"ok": ok, "message": msg})
+    ok, msg = start_avoidance(); return jsonify({"ok":ok,"message":msg})
 
 @app.route("/avoid/stop", methods=["POST"])
-def avoid_stop():
-    stop_obstacle_avoidance(send_stop=True, update_message=True); return ok_json(message="Obstacle avoidance stopped")
+def avoid_stop_route():
+    stop_avoidance(send_stop=True, update=True); return ok_r(message="Obstacle avoidance stopped")
 
 # ── 종료 ──────────────────────────────────────────────────────────────────────
 def cleanup():
     try:
-        stop_obstacle_avoidance(send_stop=True, update_message=False); time.sleep(0.1); close_lidar()
-        if ser and ser.is_open: send_to_stm32("stop"); ser.close(); log_info("[OK] Serial closed")
-    except Exception as e: log_info(f"[WARN] Cleanup: {e}")
+        stop_avoidance(send_stop=True, update=False); time.sleep(0.1); close_lidar()
+        if ser and ser.is_open: send("stop"); ser.close(); log("Serial closed")
+    except Exception as e: log(f"Cleanup: {e}")
 
 atexit.register(cleanup)
 
 if __name__ == "__main__":
-    init_serial(); ping_stm32(); send_to_stm32("stop"); init_lidar()
-    log_info(f"[WEB] http://{WEB_HOST}:{WEB_PORT}")
+    init_serial(); ping(); send("stop"); init_lidar()
+    log(f"Web: http://{WEB_HOST}:{WEB_PORT}")
     app.run(host=WEB_HOST, port=WEB_PORT, debug=False, threaded=True, use_reloader=False)
