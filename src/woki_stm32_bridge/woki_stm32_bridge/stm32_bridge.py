@@ -14,14 +14,26 @@ from std_msgs.msg import Bool, String
 
 COMMAND_MAP = {
     "ping": "PING",
-    "stop": "STOP",
     "wheel": "WHEEL",
     "ramp": "RAMP",
     "leg": "LEG",
-    "forward": "FWD",
-    "backward": "BACK",
-    "left": "TL",
-    "right": "TR",
+}
+
+MOTION_COMMAND_MAP = {
+    "wheel": {
+        "forward": "WHEEL_FWD",
+        "backward": "WHEEL_BACK",
+        "left": "WHEEL_TL",
+        "right": "WHEEL_TR",
+        "stop": "WHEEL_STOP",
+    },
+    "leg": {
+        "forward": "LEG_FWD",
+        "backward": "LEG_BACK",
+        "left": "LEG_LEFT",
+        "right": "LEG_RIGHT",
+        "stop": "LEG_STOP",
+    },
 }
 
 ALLOWED_ROS_COMMANDS = {
@@ -78,6 +90,7 @@ class WokiStm32Bridge(Node):
         self.connection_state = "DISCONNECTED"
         self.ready = False
         self.status = "DISCONNECTED"
+        self.current_mode = "wheel"
         self.last_logged_command: Optional[str] = None
         self.last_reconnect_attempt_ns: Optional[int] = None
         self.ping_outstanding = False
@@ -350,20 +363,34 @@ class WokiStm32Bridge(Node):
 
         self.send_protocol_command(command)
 
+    def resolve_protocol_command(self, command: str) -> Optional[str]:
+        raw_command = COMMAND_MAP.get(command)
+        if raw_command is not None:
+            return raw_command
+
+        mode_commands = MOTION_COMMAND_MAP.get(self.current_mode)
+        if mode_commands is None:
+            return None
+        return mode_commands.get(command)
+
     def send_protocol_command(self, command: str) -> bool:
-        if command not in COMMAND_MAP:
+        raw_command = self.resolve_protocol_command(command)
+        if raw_command is None:
             if self.context_is_ok():
                 self.get_logger().warning(
-                    f"Ignored unknown protocol command: {command!r}"
+                    f"Ignored unknown protocol command: {command!r} "
+                    f"(mode={self.current_mode!r})"
                 )
             return False
 
         if self.connection_state != "CONNECTED" or not self.ready:
             return False
 
-        raw_command = COMMAND_MAP[command]
         if not self.write_serial_line(raw_command):
             return False
+
+        if command in {"wheel", "leg"}:
+            self.current_mode = command
 
         if (
             command != self.last_logged_command
